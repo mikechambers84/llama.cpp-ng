@@ -210,6 +210,8 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     return meta_dev_ctx->simple_devs[index];
 }
 
+static ggml_backend_reg_t ggml_backend_meta_reg(void);
+
 ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
@@ -234,7 +236,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
 
     struct ggml_backend_device meta_dev = {
         /*iface  =*/ ggml_backend_meta_device_iface,
-        /*reg    =*/ nullptr,
+        /*reg    =*/ ggml_backend_meta_reg(),
         /*ctx    =*/ ctxs.back().get(),
     };
 
@@ -319,13 +321,11 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
 }
 
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
-    for (size_t i = 0; i < n_simple_bufts; i++) {
-        if (!ggml_backend_buft_is_host(ggml_backend_meta_buft_simple_buft(buft, i))) {
-            return false;
-        }
-    }
-    return true;
+    // never, even when all of the simple buffer types are host: the data of a meta tensor is spread over
+    // one allocation per device and its data pointer is a sentinel, so it cannot be dereferenced directly
+    return false;
+
+    GGML_UNUSED(buft);
 }
 
 static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_iface = {
@@ -1123,7 +1123,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
 
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
-    return (void *) 0x1000000000000000; // FIXME
+    // sentinel: the real data is in the per-device buffers, ggml-alloc only does address arithmetic on this
+    return (void *) 0x1000000000000000;
 }
 
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor) {
@@ -1550,7 +1551,7 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         t->buffer = meta_buf;
         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
-        t->data = (void *) 0x2000000000000000; // FIXME
+        t->data = (void *) 0x2000000000000000; // sentinel, see ggml_backend_meta_buffer_get_base
     }
     for (size_t i = 0; i < n_simple_bufts; i++) {
         ggml_context * ctx = meta_buf_ctx->stc_static.ctxs[i].get();
@@ -2268,4 +2269,65 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+//
+// meta backend reg
+//
+
+static void ggml_backend_meta_set_n_threads(ggml_backend_t backend, int n_threads) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+
+    std::vector<ggml_backend_t> simple_backends;
+    simple_backends.reserve(n_backends);
+    for (size_t i = 0; i < n_backends; i++) {
+        simple_backends.push_back(ggml_backend_meta_simple_backend(backend, i));
+    }
+
+    ggml_backend_set_n_threads_total(simple_backends.data(), simple_backends.size(), n_threads);
+}
+
+static const char * ggml_backend_meta_reg_get_name(ggml_backend_reg_t reg) {
+    return "Meta";
+
+    GGML_UNUSED(reg);
+}
+
+static size_t ggml_backend_meta_reg_get_device_count(ggml_backend_reg_t reg) {
+    // meta devices are created on demand by ggml_backend_meta_device, they are never registered
+    return 0;
+
+    GGML_UNUSED(reg);
+}
+
+static ggml_backend_dev_t ggml_backend_meta_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    GGML_ABORT("meta devices cannot be enumerated");
+
+    GGML_UNUSED(reg);
+    GGML_UNUSED(index);
+}
+
+static void * ggml_backend_meta_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
+        return (void *) ggml_backend_meta_set_n_threads;
+    }
+    return nullptr;
+
+    GGML_UNUSED(reg);
+}
+
+static ggml_backend_reg_t ggml_backend_meta_reg(void) {
+    static const ggml_backend_reg_i iface = {
+        /* .get_name         = */ ggml_backend_meta_reg_get_name,
+        /* .get_device_count = */ ggml_backend_meta_reg_get_device_count,
+        /* .get_device       = */ ggml_backend_meta_reg_get_device,
+        /* .get_proc_address = */ ggml_backend_meta_reg_get_proc_address,
+    };
+    static ggml_backend_reg reg = {
+        /* .api_version = */ GGML_BACKEND_API_VERSION,
+        /* .iface       = */ iface,
+        /* .context     = */ nullptr,
+    };
+
+    return &reg;
 }

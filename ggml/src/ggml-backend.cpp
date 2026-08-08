@@ -472,6 +472,79 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
     return backend->device;
 }
 
+void ggml_backend_set_n_threads_total(ggml_backend_t * backends, size_t n_backends, int n_threads) {
+    GGML_ASSERT(backends);
+    GGML_ASSERT(n_threads > 0);
+
+    std::vector<ggml_backend_t>               bs;
+    std::vector<ggml_backend_set_n_threads_t> set_fns;
+    std::vector<int>                          caps;
+
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+        if (!reg) {
+            continue;
+        }
+        auto set_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (!set_fn) {
+            continue;
+        }
+        auto cap_fn = (ggml_backend_dev_get_n_threads_max_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_n_threads_max");
+
+        bs     .push_back(backends[i]);
+        set_fns.push_back(set_fn);
+        caps   .push_back(cap_fn ? cap_fn(dev) : 0);
+    }
+
+    const int n = (int) bs.size();
+    if (n == 0) {
+        return;
+    }
+
+    // every participating backend needs at least one worker thread, so the effective total can exceed n_threads
+    if (n_threads < n) {
+        static int n_threads_warned = 0;
+        if (n_threads_warned != n_threads) {
+            n_threads_warned = n_threads;
+            GGML_LOG_WARN("%s: n_threads (%d) is below the number of participating backends (%d), using 1 thread each (%d total)\n",
+                    __func__, n_threads, n, n);
+        }
+        for (int i = 0; i < n; i++) {
+            set_fns[i](bs[i], 1);
+        }
+        return;
+    }
+
+    // weight by capacity only if every backend reports one, otherwise split evenly
+    bool weighted = true;
+    for (int i = 0; i < n; i++) {
+        weighted = weighted && caps[i] > 0;
+    }
+
+    int64_t total_weight = 0;
+    for (int i = 0; i < n; i++) {
+        total_weight += weighted ? caps[i] : 1;
+    }
+
+    // cumulative floor, so that the shares add up to exactly n_threads before the capacity clamp
+    int64_t cum      = 0;
+    int     assigned = 0;
+    for (int i = 0; i < n; i++) {
+        cum += weighted ? caps[i] : 1;
+
+        const int upto = (int) ((int64_t) n_threads * cum / total_weight);
+
+        int share = upto - assigned;
+        assigned  = upto;
+
+        if (caps[i] > 0) {
+            share = std::min(share, caps[i]);
+        }
+        set_fns[i](bs[i], std::max(share, 1));
+    }
+}
+
 // backend copy
 
 void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst) {

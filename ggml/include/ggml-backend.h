@@ -39,6 +39,8 @@ extern "C" {
     GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
     GGML_API size_t                ggml_backend_buft_get_max_size  (ggml_backend_buffer_type_t buft);
     GGML_API size_t                ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    // true only if the data of the tensors is in host memory AND uses the standard ggml tensor layout,
+    // i.e. if tensor->data can be dereferenced directly
     GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
 
@@ -211,6 +213,8 @@ extern "C" {
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
+    // Get the maximum number of threads the device can use (0 if not applicable)
+    typedef int                          (*ggml_backend_dev_get_n_threads_max_t)(ggml_backend_dev_t device);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
@@ -221,6 +225,10 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+
+    // Set the total number of threads to use across the given backends, distributed in proportion to
+    // ggml_backend_dev_get_n_threads_max. Backends that do not use CPU threads are skipped.
+    GGML_API void ggml_backend_set_n_threads_total(ggml_backend_t * backends, size_t n_backends, int n_threads);
 
     //
     // Backend registry

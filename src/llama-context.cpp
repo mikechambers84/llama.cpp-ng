@@ -431,9 +431,8 @@ llama_context::llama_context(
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
-                auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    // ignore CPU backend
+                if (backend.get() == backend_cpu) {
+                    // ignore the fallback CPU backend, other CPU devices are checked like any other device
                     // TODO: should we ignore ACCEL types too?
                     continue;
                 }
