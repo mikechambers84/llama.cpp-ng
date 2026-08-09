@@ -98,6 +98,7 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 // CPU backend - backend (stream)
 
 static int ggml_backend_cpu_device_get_n_threads_max(ggml_backend_dev_t dev);
+static ggml_threadpool_t ggml_backend_cpu_device_threadpool(ggml_backend_dev_t dev, int n_threads);
 
 // a NUMA node backend computes on its own dispatcher thread. the dispatcher is pinned to the node, so the
 // OpenMP team and the thread pool it drives stay on the node instead of following the scheduler thread
@@ -202,6 +203,7 @@ struct ggml_backend_cpu_context {
 
     // owned by a NUMA node backend, it is pinned to the CPUs of that node
     ggml_threadpool_t   own_threadpool;
+    int                 own_threadpool_size;
 
     // owned by a NUMA node backend, NULL means graph_compute runs synchronously on the calling thread
     struct ggml_backend_cpu_async * async;
@@ -417,6 +419,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->threadpool          = NULL;
     ctx->own_threadpool      = NULL;
+    ctx->own_threadpool_size = 0;
     ctx->async               = NULL;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
@@ -454,6 +457,22 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
     const int n_threads_max = ggml_backend_cpu_device_get_n_threads_max(backend_cpu->device);
     if (n_threads_max > 0) {
         n_threads = std::min(n_threads, n_threads_max);
+    }
+
+    // the node pool starts at one thread per physical core; a larger explicit request (SMT
+    // threads) recreates it at the requested size. it only ever grows: a pool larger than the
+    // active thread count costs a little (idle workers spin the poll window once per graph
+    // before sleeping), so the growth only happens when the user asks for the threads
+    if (ctx->own_threadpool != NULL && n_threads > ctx->own_threadpool_size) {
+        ggml_threadpool_t tp = ggml_backend_cpu_device_threadpool(backend_cpu->device, n_threads);
+        if (tp != NULL) {
+            ggml_threadpool_free(ctx->own_threadpool);
+            ctx->own_threadpool      = tp;
+            ctx->own_threadpool_size = n_threads;
+        } else {
+            GGML_LOG_WARN("%s: failed to grow the thread pool to %d threads\n", __func__, n_threads);
+            n_threads = ctx->own_threadpool_size;
+        }
     }
 
     ctx->n_threads = n_threads;
@@ -728,12 +747,16 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
 
 // a thread pool restricted to the CPUs of one node. it is created paused so that the affinity is applied
 // to whichever thread ends up driving the graph, not to the thread that happens to build the backend
-static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu_device_context * ctx) {
+static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu_device_context * ctx, int n_threads) {
     struct ggml_threadpool_params tpp;
 
-    // one thread per physical core: extra threads would spend the poll window spinning on the SMT
-    // siblings of the compute threads, and the budget never assigns more than the core count anyway
-    ggml_threadpool_params_init(&tpp, ctx->n_cores > 0 ? ctx->n_cores : (int) ctx->cpus.size());
+    // default is one thread per physical core: extra threads would spend the poll window spinning
+    // on the SMT siblings of the compute threads. an explicit larger thread count grows the pool,
+    // see ggml_backend_cpu_set_n_threads
+    if (n_threads <= 0) {
+        n_threads = ctx->n_cores > 0 ? ctx->n_cores : (int) ctx->cpus.size();
+    }
+    ggml_threadpool_params_init(&tpp, n_threads);
 
     for (int cpu : ctx->cpus) {
         if (cpu < GGML_MAX_N_THREADS) {
@@ -745,6 +768,14 @@ static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu
     tpp.paused = true;
 
     return ggml_threadpool_new(&tpp);
+}
+
+static ggml_threadpool_t ggml_backend_cpu_device_threadpool(ggml_backend_dev_t dev, int n_threads) {
+    const struct ggml_backend_cpu_device_context * dev_ctx = (const struct ggml_backend_cpu_device_context *)dev->context;
+    if (dev_ctx->numa_node < 0) {
+        return NULL;
+    }
+    return ggml_backend_cpu_numa_threadpool(dev_ctx, n_threads);
 }
 
 static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
@@ -760,7 +791,8 @@ static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t de
     if (dev_ctx->numa_node >= 0) {
         struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-        ctx->own_threadpool = ggml_backend_cpu_numa_threadpool(dev_ctx);
+        ctx->own_threadpool      = ggml_backend_cpu_numa_threadpool(dev_ctx, 0);
+        ctx->own_threadpool_size = dev_ctx->n_cores;
         if (ctx->own_threadpool == NULL) {
             GGML_LOG_ERROR("%s: failed to create the thread pool of %s\n", __func__, dev_ctx->name.c_str());
             ggml_backend_free(backend);
