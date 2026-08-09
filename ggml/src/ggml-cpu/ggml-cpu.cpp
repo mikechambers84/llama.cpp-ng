@@ -77,17 +77,9 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
     return bufts;
 }
 
-static ggml_backend_buffer_type_t * ggml_backend_cpu_device_get_extra_buffers_type(ggml_backend_dev_t device) {
-    static std::vector<ggml_backend_buffer_type_t> extra_bufts = [] {
-        std::vector<ggml_backend_buffer_type_t> bufts = ggml_backend_cpu_get_extra_buffer_types();
-        bufts.push_back(nullptr);
-        return bufts;
-    }();
+struct ggml_backend_cpu_device_context;
 
-    return extra_bufts.data();
-
-    GGML_UNUSED(device);
-}
+static ggml_backend_buffer_type_t * ggml_backend_cpu_device_get_extra_buffers_type(ggml_backend_dev_t device);
 
 static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buft) {
     for (auto * extra : ggml_backend_cpu_get_extra_buffer_types()) {
@@ -95,7 +87,8 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
             return true;
         }
     }
-    return false;
+    // per node repack buffer types are not in the global list, match them by kind
+    return ggml_backend_cpu_buft_is_repack(buft);
 }
 
 // CPU backend - backend (stream)
@@ -323,6 +316,9 @@ struct ggml_backend_cpu_device_context {
     // the node local buffer type of this device, its name is the device name so that it stays unique
     ggml_backend_buffer_type buft = {};
 
+    // NULL terminated extra buffer types of a node device (its own node local repack), see get_extra_buffers_type
+    std::vector<ggml_backend_buffer_type_t> extra_bufts;
+
     ggml_backend_cpu_device_context() {
 #ifdef __APPLE__
         size_t len = 0;
@@ -444,6 +440,31 @@ static void ggml_backend_cpu_numa_buffer_type_init(ggml_backend_cpu_device_conte
         /* .device  = */ dev,
         /* .context = */ NULL,
     };
+
+    // a node device offers its own node local repack, and only that. AMX and KleidiAI stay on the plain device
+    ctx->extra_bufts.clear();
+    for (auto * global : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (ggml_backend_cpu_buft_is_repack(global)) {
+            ctx->extra_bufts.push_back(ggml_backend_cpu_repack_buffer_type_for_device(dev));
+        }
+    }
+    ctx->extra_bufts.push_back(NULL);
+}
+
+static ggml_backend_buffer_type_t * ggml_backend_cpu_device_get_extra_buffers_type(ggml_backend_dev_t device) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)device->context;
+
+    if (ctx->numa_node >= 0) {
+        return ctx->extra_bufts.data();
+    }
+
+    static std::vector<ggml_backend_buffer_type_t> extra_bufts = [] {
+        std::vector<ggml_backend_buffer_type_t> bufts = ggml_backend_cpu_get_extra_buffer_types();
+        bufts.push_back(nullptr);
+        return bufts;
+    }();
+
+    return extra_bufts.data();
 }
 
 // CPU backend - device interface
@@ -655,7 +676,15 @@ static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     if (ctx->numa_node >= 0) {
         // a node device only takes its own buffers, otherwise the scheduler would give it the tensors of
         // another node, which it would then compute on remote memory
-        return buft == ggml_backend_dev_buffer_type(dev) || ggml_backend_cpu_is_extra_buffer_type(buft);
+        if (buft == ggml_backend_dev_buffer_type(dev)) {
+            return true;
+        }
+        for (auto * extra : ctx->extra_bufts) {
+            if (extra == buft) {
+                return true;
+            }
+        }
+        return false;
     }
 
     return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);

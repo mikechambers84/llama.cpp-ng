@@ -985,22 +985,34 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     }
 
-    // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    auto add_default_buft = [&]() {
+        buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    };
 
-    // add the device extra buffer type (if any)
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg) {
-        auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    auto add_extra_bufts = [&]() {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg) {
+            auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
 
-        if (ggml_backend_dev_get_extra_bufts_fn) {
-            ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
-            while (extra_bufts && *extra_bufts) {
-                buft_list.emplace_back(dev, *extra_bufts);
-                ++extra_bufts;
+            if (ggml_backend_dev_get_extra_bufts_fn) {
+                ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
+                while (extra_bufts && *extra_bufts) {
+                    buft_list.emplace_back(dev, *extra_bufts);
+                    ++extra_bufts;
+                }
             }
         }
+    };
+
+    // for CPU devices (a NUMA node under --numa split) the extra buffer types, i.e. repack, must come first,
+    // as in make_cpu_buft_list, otherwise the plain node buffer type wins and repacking never happens
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        add_extra_bufts();
+        add_default_buft();
+    } else {
+        add_default_buft();
+        add_extra_bufts();
     }
 
     return buft_list;
