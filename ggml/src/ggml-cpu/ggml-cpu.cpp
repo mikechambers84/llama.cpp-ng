@@ -102,7 +102,10 @@ static ggml_threadpool_t ggml_backend_cpu_device_threadpool(ggml_backend_dev_t d
 
 // a NUMA node backend computes on its own dispatcher thread. the dispatcher is pinned to the node, so the
 // OpenMP team and the thread pool it drives stay on the node instead of following the scheduler thread
-// across sockets, and graph_compute becomes asynchronous, which lets several node backends overlap
+// across sockets, and graph_compute becomes asynchronous, which lets several node backends overlap.
+//
+// as with every asynchronous backend, freeing a buffer an in-flight graph still uses is the caller's
+// responsibility (synchronize first); llama pre-reserves its compute buffers, so this does not come up there
 struct ggml_backend_cpu_async {
     std::thread             thread;
     std::mutex              mutex;
@@ -110,6 +113,7 @@ struct ggml_backend_cpu_async {
 
     struct ggml_cgraph *    graph  = NULL; // pending work, a private copy owned by this backend
     enum ggml_status        status = GGML_STATUS_SUCCESS; // of the last completed graph
+    bool                    status_logged = false; // a pending failure was already reported by synchronize
     bool                    stop   = false;
 
     // graph_compute_async must consume the graph before it returns: the caller reuses the memory that
@@ -322,7 +326,8 @@ static void ggml_backend_cpu_async_loop(struct ggml_backend_cpu_context * cpu_ct
         {
             std::unique_lock<std::mutex> lock(a->mutex);
             a->cv.wait(lock, [a] { return a->graph != NULL || a->stop; });
-            if (a->stop) {
+            // a graph that was handed over before the stop still runs, it must not be dropped silently
+            if (a->graph == NULL) {
                 return;
             }
             graph = a->graph;
@@ -342,6 +347,16 @@ static void ggml_backend_cpu_async_loop(struct ggml_backend_cpu_context * cpu_ct
             a->cv.notify_all();
         }
     }
+}
+
+// a failure of an earlier asynchronous graph that no graph_compute call has consumed yet
+static bool ggml_backend_cpu_async_pending_error(struct ggml_backend_cpu_context * cpu_ctx) {
+    struct ggml_backend_cpu_async * a = cpu_ctx->async;
+    if (a == NULL) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(a->mutex);
+    return a->status != GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_cpu_async_wait_idle(struct ggml_backend_cpu_context * cpu_ctx) {
@@ -364,23 +379,36 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     std::unique_lock<std::mutex> lock(a->mutex);
     a->cv.wait(lock, [a] { return a->graph == NULL; });
 
-    // as with other asynchronous backends, a failure surfaces on the next call
-    if (a->status != GGML_STATUS_SUCCESS) {
-        const enum ggml_status status = a->status;
-        a->status = GGML_STATUS_SUCCESS;
-        return status;
-    }
+    // as with other asynchronous backends, a failure surfaces on the next call. the new graph
+    // still runs: dropping it here would silently desynchronize a caller that continues after
+    // the error
+    const enum ggml_status status = a->status;
+    a->status        = GGML_STATUS_SUCCESS;
+    a->status_logged = false;
 
     a->graph = a->take(cgraph);
     a->cv.notify_all();
 
-    return GGML_STATUS_SUCCESS;
+    return status;
 }
 
 static void ggml_backend_cpu_synchronize(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    ggml_backend_cpu_async_wait_idle(cpu_ctx);
+    struct ggml_backend_cpu_async * a = cpu_ctx->async;
+    if (a == NULL) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(a->mutex);
+    a->cv.wait(lock, [a] { return a->graph == NULL; });
+
+    // synchronize cannot return a status, so a failed graph is reported here and stays pending
+    // for the next graph_compute to return. GGML_STATUS_ABORTED is regular abort callback flow
+    if (a->status != GGML_STATUS_SUCCESS && a->status != GGML_STATUS_ABORTED && !a->status_logged) {
+        GGML_LOG_ERROR("%s: an asynchronous graph failed with status %d\n", __func__, a->status);
+        a->status_logged = true;
+    }
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
@@ -506,6 +534,8 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+
+    ggml_backend_cpu_async_wait_idle(ctx);
     ctx->use_ref = use_ref;
 }
 
@@ -1250,6 +1280,14 @@ static bool ggml_backend_cpu_comm_allreduce_tensor(void * comm_ctx, struct ggml_
     // the partials were dispatched to the backends just before this call
     for (size_t j = 0; j < n_backends; j++) {
         ggml_backend_synchronize(comm->backends[j]);
+    }
+
+    // if a backend failed, its partial is garbage and the computation is already lost; skip the
+    // reduction and let the failure surface from that backend's next graph_compute call
+    for (size_t j = 0; j < n_backends; j++) {
+        if (ggml_backend_cpu_async_pending_error((struct ggml_backend_cpu_context *)comm->backends[j]->context)) {
+            return true;
+        }
     }
 
     // sum the partials of the backends that computed one (a backend whose slice of the producing
