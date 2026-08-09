@@ -62,15 +62,16 @@ struct ggml_backend_meta_device_context {
     ggml_backend_meta_device_context(
             std::vector<ggml_backend_dev_t> simple_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) :
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
+        // built from the member: the parameter was moved from
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (this->simple_devs[i]);
+            description += ggml_backend_dev_description(this->simple_devs[i]);
         }
         name        += ")";
         description += ")";
@@ -440,11 +441,19 @@ static ggml_backend_buffer_type_t * ggml_backend_meta_dev_get_extra_bufts(ggml_b
     }
 
     // the k-th extra buffer type of every device is paired into one meta buffer type, which only
-    // makes sense when every device has the same extras. a heterogeneous set exposes none
+    // makes sense when every device has the same extras. a heterogeneous set exposes none; the
+    // kind of a buffer type is identified by its get_name implementation, as in the CPU backend
     size_t n_extras = extras[0].size();
     for (size_t i = 1; i < n_devs; i++) {
         if (extras[i].size() != n_extras) {
             n_extras = 0;
+            break;
+        }
+        for (size_t k = 0; k < n_extras; k++) {
+            if (extras[i][k]->iface.get_name != extras[0][k]->iface.get_name) {
+                n_extras = 0;
+                break;
+            }
         }
     }
 
@@ -1367,6 +1376,10 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     // a shard in an extra buffer type (e.g. CPU repack) may transform the data on write and can
     // therefore only accept whole-tensor writes. such shards are assembled here first and handed
     // over in a single set_tensor call
+    // whether a shard needs staging is decided eagerly (so that a partial write of a transforming
+    // shard fails loudly no matter which branch runs), the buffers are allocated only when a
+    // branch actually writes through shard_set_2d
+    std::vector<bool>              staging(n_bufs, false);
     std::vector<std::vector<char>> staged(n_bufs);
     for (size_t j = 0; j < n_bufs; j++) {
         ggml_backend_buffer_t sbuf = ggml_backend_meta_buffer_simple_buffer(buffer, j);
@@ -1376,18 +1389,19 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         ggml_backend_buffer_type_t sbuft = ggml_backend_buffer_get_type(sbuf);
         ggml_backend_dev_t         sdev  = ggml_backend_buft_get_device(sbuft);
         if (sdev != nullptr && sbuft != ggml_backend_dev_buffer_type(sdev)) {
-            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-            const size_t nbytes = ggml_nbytes(simple_tensor);
-            if (nbytes > 0) {
+            if (ggml_nbytes(ggml_backend_meta_buffer_simple_tensor(tensor, j)) > 0) {
                 GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor)); // partial writes cannot be transformed
-                staged[j].resize(nbytes);
+                staging[j] = true;
             }
         }
     }
     // writes either strided pieces directly into the shard, or gathers them for the staged hand-over
     auto shard_set_2d = [&](size_t j, ggml_tensor * simple_tensor, const void * src,
                             size_t s_offset, size_t nbytes, size_t count, size_t stride_dst, size_t stride_src) {
-        if (!staged[j].empty()) {
+        if (staging[j]) {
+            if (staged[j].empty()) {
+                staged[j].resize(ggml_nbytes(simple_tensor));
+            }
             for (size_t r = 0; r < count; r++) {
                 memcpy(staged[j].data() + s_offset + r*stride_dst, (const char *) src + r*stride_src, nbytes);
             }
