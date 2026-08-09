@@ -704,8 +704,12 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 // CLI argument parsing functions
 //
 
+static void common_params_numa_prescan(int argc, char ** argv);
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
+
+    common_params_numa_prescan(argc, argv);
 
     // setup log directly from params.verbosity: see tools/cli/cli.cpp
     common_log_set_verbosity_thold(params.verbosity);
@@ -1055,6 +1059,33 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
     }
 }
 
+// --numa split registers one device per NUMA node, and -dev, -ot and --list-devices all resolve devices while
+// the arguments are still being read. The value is therefore looked up here first, so that those work whatever
+// order the arguments are given in. Registration is idempotent, the later llama_numa_init does nothing.
+static void common_params_numa_prescan(int argc, char ** argv) {
+    std::string value;
+
+    if (const char * env = std::getenv("LLAMA_ARG_NUMA")) {
+        value = env;
+    }
+    for (int i = 1; i + 1 < argc; i++) {
+        if (std::strcmp(argv[i], "--numa") == 0) {
+            value = argv[i + 1];
+        }
+    }
+
+    if (value != "split") {
+        return;
+    }
+
+    // the CPU backend is a shared library in some builds, it has to be loaded before it can be asked
+    ggml_backend_load_all();
+
+    if (llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+        throw std::runtime_error("--numa split could not be initialized");
+    }
+}
+
 static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value) {
     std::vector<ggml_backend_dev_t> devices;
     auto dev_names = string_split<std::string>(value, ',');
@@ -1067,8 +1098,9 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         ggml_backend_load_all();
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
+            if (!dev || (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && common_dev_numa_node(dev) < 0)) {
+                throw std::invalid_argument(string_format("invalid device: %s%s", device.c_str(),
+                            dev == nullptr ? " (NUMA CPU devices need --numa split)" : ""));
             }
             devices.push_back(dev);
         }
@@ -1085,7 +1117,7 @@ void common_print_available_devices() {
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU || common_dev_numa_node(dev) >= 0) {
             devices.push_back(dev);
         }
     }
@@ -2626,12 +2658,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
+        "- split: expose every NUMA node as its own device, CPU0, CPU1 ... , so that -dev, -ot and the split modes\n"
+        "  can place weights and threads per node. Linux only, -t is the total over the nodes in use\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "split") { params.numa = GGML_NUMA_STRATEGY_SPLIT; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));

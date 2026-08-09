@@ -141,6 +141,28 @@ static std::string get_gpu_info() {
     return join(gpu_list, ", ");
 }
 
+// see common_params_numa_prescan, the NUMA devices have to exist before -dev is resolved
+static void numa_prescan(int argc, char ** argv) {
+    std::string value;
+
+    for (int i = 1; i + 1 < argc; i++) {
+        if (std::strcmp(argv[i], "--numa") == 0) {
+            value = argv[i + 1];
+        }
+    }
+
+    if (value != "split") {
+        return;
+    }
+
+    ggml_backend_load_all();
+
+    if (llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+        fprintf(stderr, "error: --numa split could not be initialized\n");
+        exit(1);
+    }
+}
+
 static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & value) {
     std::vector<ggml_backend_dev_t> devices;
     std::string                     trimmed = string_strip(value);
@@ -163,8 +185,9 @@ static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & val
             throw std::invalid_argument("invalid device specification");
         }
         auto * dev = ggml_backend_dev_by_name(dev_name.c_str());
-        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            throw std::invalid_argument(string_format("invalid device: %s", dev_name.c_str()));
+        if (!dev || (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && common_dev_numa_node(dev) < 0)) {
+            throw std::invalid_argument(string_format("invalid device: %s%s", dev_name.c_str(),
+                        dev == nullptr ? " (NUMA CPU devices need --numa split)" : ""));
         }
         devices.push_back(dev);
     }
@@ -412,7 +435,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("\n");
     printf("options:\n");
     printf("  -h, --help\n");
-    printf("  --numa <distribute|isolate|numactl>         numa mode (default: disabled)\n");
+    printf("  --numa <distribute|isolate|numactl|split>   numa mode (default: disabled)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
     printf("  --delay <0...N> (seconds)                   delay between each test (default: %d)\n", cmd_params_defaults.delay);
@@ -505,6 +528,8 @@ static ggml_type ggml_type_from_name(const std::string & s) {
 }
 
 static cmd_params parse_cmd_params(int argc, char ** argv) {
+    numa_prescan(argc, argv);
+
     cmd_params        params;
     std::string       arg;
     bool              invalid_param = false;
@@ -809,6 +834,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     params.numa = GGML_NUMA_STRATEGY_ISOLATE;
                 } else if (value == "numactl") {
                     params.numa = GGML_NUMA_STRATEGY_NUMACTL;
+                } else if (value == "split") {
+                    params.numa = GGML_NUMA_STRATEGY_SPLIT;
                 } else {
                     invalid_param = true;
                     break;

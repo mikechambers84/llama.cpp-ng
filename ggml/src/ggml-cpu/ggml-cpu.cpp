@@ -528,8 +528,7 @@ static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu
         }
     }
 
-    // several of these pools exist at once, workers that are not computing must not spin
-    tpp.poll   = 0;
+    // the pools are pinned to disjoint CPU sets, so an idle pool does not take cores from a busy one
     tpp.paused = true;
 
     return ggml_threadpool_new(&tpp);

@@ -2219,3 +2219,14 @@ void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
 }
+
+int common_dev_numa_node(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return -1;
+    }
+
+    auto * fn = (ggml_backend_dev_get_numa_node_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_numa_node");
+
+    return fn ? fn(dev) : -1;
+}
