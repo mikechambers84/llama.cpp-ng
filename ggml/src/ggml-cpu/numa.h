@@ -16,7 +16,7 @@ struct node {
     int              n_cores = 0; // usable physical cores
 
     size_t mem_total     = 0;
-    size_t mem_available = 0;
+    size_t mem_available = 0; // free + reclaimable page cache; per node meminfo has no MemAvailable
 };
 
 // nodes that are online and have both usable CPUs and memory, empty if NUMA is not usable here

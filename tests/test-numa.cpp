@@ -50,7 +50,9 @@ static fs::path make_sysfs(const std::string & name, const std::string & online,
         write_file(dir / "cpulist", n.cpulist + "\n");
         write_file(dir / "meminfo",
                 "Node " + std::to_string(n.id) + " MemTotal:       " + std::to_string(n.mem_total_kb) + " kB\n"
-                "Node " + std::to_string(n.id) + " MemFree:        " + std::to_string(n.mem_total_kb / 2) + " kB\n");
+                "Node " + std::to_string(n.id) + " MemFree:        " + std::to_string(n.mem_total_kb / 4) + " kB\n"
+                "Node " + std::to_string(n.id) + " Active(file):   " + std::to_string(n.mem_total_kb / 8) + " kB\n"
+                "Node " + std::to_string(n.id) + " Inactive(file): " + std::to_string(n.mem_total_kb / 4) + " kB\n");
 
         for (int cpu : parse_list(n.cpulist)) {
             const int sibling = cpu < smt_offset ? cpu + smt_offset : cpu - smt_offset;
@@ -86,6 +88,8 @@ int main() {
             check(nodes[1].cpus == std::vector<int>({2, 3, 50, 51}), "node 1 cpus");
             check(nodes[0].n_cores == 2 && nodes[1].n_cores == 2, "hyperthreads counted as one core");
             check(nodes[0].mem_total == 8000ull * 1024, "memory in bytes");
+            // MemFree plus Inactive(file), the reclaimable page cache; Active(file) is not counted
+            check(nodes[0].mem_available == (2000ull + 2000ull) * 1024, "available includes reclaimable cache");
         }
     }
     {

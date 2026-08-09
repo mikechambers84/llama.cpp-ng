@@ -138,7 +138,9 @@ std::vector<node> parse_topology(const std::string & sysfs_root, const std::vect
         std::string meminfo;
         read_file(node_dir + "/meminfo", meminfo);
         n.mem_total     = parse_meminfo(meminfo, "MemTotal");
-        n.mem_available = parse_meminfo(meminfo, "MemFree");
+        // there is no per node MemAvailable; free plus reclaimable page cache is the usable estimate,
+        // MemFree alone would report a node full of cached file pages as having no memory
+        n.mem_available = parse_meminfo(meminfo, "MemFree") + parse_meminfo(meminfo, "Inactive(file)");
 
         // a node is only usable if it can both run threads and hold weights
         if (n.cpus.empty() || n.mem_total == 0) {
@@ -159,7 +161,7 @@ void refresh_memory(node & n) {
         return;
     }
     n.mem_total     = parse_meminfo(meminfo, "MemTotal");
-    n.mem_available = parse_meminfo(meminfo, "MemFree");
+    n.mem_available = parse_meminfo(meminfo, "MemFree") + parse_meminfo(meminfo, "Inactive(file)");
 }
 
 #if defined(__gnu_linux__)
@@ -265,14 +267,16 @@ void * alloc_onnode(size_t size, int node_id, std::string & error) {
 
     const size_t len = page_align(size);
 
-    // MPOL_BIND reports an over-commit as an OOM when the pages are faulted, which would be a crash in the
-    // middle of loading, so refuse here instead
+    // MPOL_BIND reports an over-commit as an OOM when the pages are faulted, which would be a crash
+    // in the middle of loading, so an allocation that cannot fit in the node at all is refused here.
+    // merely exceeding the free + reclaimable estimate is not an error: the estimate is imprecise
+    // and the kernel reclaims cache as the pages fault in (the caller warns about it)
     struct node n;
     n.id = node_id;
     refresh_memory(n);
-    if (n.mem_available > 0 && len > n.mem_available) {
-        error = "node " + std::to_string(node_id) + " has " + std::to_string(n.mem_available >> 20) +
-                " MiB available, need " + std::to_string(len >> 20) + " MiB";
+    if (n.mem_total > 0 && len > n.mem_total) {
+        error = "node " + std::to_string(node_id) + " has " + std::to_string(n.mem_total >> 20) +
+                " MiB in total, need " + std::to_string(len >> 20) + " MiB";
         return nullptr;
     }
 

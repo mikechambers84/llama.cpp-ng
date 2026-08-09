@@ -605,6 +605,18 @@ static ggml_backend_buffer_t ggml_backend_cpu_numa_buffer_type_alloc_buffer(ggml
 
     std::string error;
 
+    // the free + reclaimable estimate is imprecise and the kernel reclaims page cache as the pages
+    // fault in, so exceeding it is only worth a warning, not a refusal
+    {
+        ggml::cpu::numa::node n;
+        n.id = ctx->numa_node;
+        ggml::cpu::numa::refresh_memory(n);
+        if (n.mem_available > 0 && size > n.mem_available) {
+            GGML_LOG_WARN("%s: %s has about %zu MiB available but %zu MiB are requested, faulting the memory in may fail\n",
+                    __func__, ctx->name.c_str(), n.mem_available >> 20, size >> 20);
+        }
+    }
+
     void * data = ggml::cpu::numa::alloc_onnode(size, ctx->numa_node, error);
     if (data == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate %zu MiB on %s: %s\n", __func__, size >> 20, ctx->name.c_str(), error.c_str());
