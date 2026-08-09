@@ -16,7 +16,9 @@
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
 #include <memory>
+#include <map>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -4746,10 +4748,26 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_UNUSED(buffer);
 }
 
-static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    return "CPU_REPACK";
+// names of the per device repack buffer type instances, see ggml_backend_cpu_repack_buffer_type_for_device
+static std::mutex & ggml_backend_cpu_repack_buffer_type_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+static std::map<const ggml_backend_buffer_type *, std::string> & ggml_backend_cpu_repack_buffer_type_names() {
+    static std::map<const ggml_backend_buffer_type *, std::string> names;
+    return names;
+}
 
-    GGML_UNUSED(buft);
+static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    // a per device instance is named after its device ("CPU0_REPACK"): several maps (e.g. the
+    // llama model loader) key buffer types by name, so the per node instances must not collide
+    std::lock_guard<std::mutex> lock(ggml_backend_cpu_repack_buffer_type_mutex());
+    const auto & names = ggml_backend_cpu_repack_buffer_type_names();
+    const auto   it    = names.find(buft);
+    if (it != names.end()) {
+        return it->second.c_str();
+    }
+    return "CPU_REPACK";
 }
 
 bool ggml_backend_cpu_buft_is_repack(ggml_backend_buffer_type_t buft) {
@@ -4861,6 +4879,11 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_for_device(ggml_b
     auto buft = std::make_unique<ggml_backend_buffer_type>();
     *buft = *ggml_backend_cpu_repack_buffer_type();
     buft->device = dev;
+    {
+        std::lock_guard<std::mutex> name_lock(ggml_backend_cpu_repack_buffer_type_mutex());
+        ggml_backend_cpu_repack_buffer_type_names().emplace(
+            buft.get(), std::string(ggml_backend_dev_name(dev)) + "_REPACK");
+    }
 
     bufts.emplace_back(dev, std::move(buft));
     return bufts.back().second.get();
