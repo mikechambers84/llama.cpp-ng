@@ -800,9 +800,19 @@ static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu
     }
     ggml_threadpool_params_init(&tpp, n_threads);
 
+    int n_masked = 0;
     for (int cpu : ctx->cpus) {
         if (cpu < GGML_MAX_N_THREADS) {
             tpp.cpumask[cpu] = true;
+            n_masked++;
+        }
+    }
+    if (n_masked < (int) ctx->cpus.size()) {
+        GGML_LOG_WARN("%s: %zu CPUs of %s are above the supported maximum of %d and cannot be pinned\n",
+                __func__, ctx->cpus.size() - n_masked, ctx->name.c_str(), GGML_MAX_N_THREADS);
+        if (n_masked == 0) {
+            // an empty mask would mean "no affinity", i.e. a pool that silently floats off its node
+            return NULL;
         }
     }
 
@@ -1075,6 +1085,12 @@ static enum ggml_numa_split_status ggml_backend_cpu_numa_split_init(ggml_backend
         if (probe == NULL) {
             GGML_LOG_ERROR("%s: node %d cannot provide node local memory, --numa split is not available\n",
                     __func__, node.id);
+            // the devices built so far are about to be destroyed; drop the repack buffer types
+            // that were created for them, they would keep dangling device pointers otherwise
+            ggml_backend_cpu_repack_buffer_type_forget_device(dev.get());
+            for (const auto & d : devs) {
+                ggml_backend_cpu_repack_buffer_type_forget_device(d.get());
+            }
             status = GGML_NUMA_SPLIT_STATUS_FAILED;
             return (enum ggml_numa_split_status) status;
         }

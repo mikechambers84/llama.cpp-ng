@@ -172,6 +172,9 @@ int main() {
         check(alloc_onnode(size, 999, error) == nullptr && !error.empty(), "allocation on an unusable node fails");
     }
 
+    // in GGML_BACKEND_DL builds nothing has loaded the CPU backend yet
+    ggml_backend_load_all();
+
     // without --numa split the CPU backend must look exactly like it always did
     printf("cpu device defaults\n");
     {

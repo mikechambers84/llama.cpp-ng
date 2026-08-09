@@ -4871,12 +4871,19 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     return &ggml_backend_cpu_buffer_type_repack;
 }
 
-ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_for_device(ggml_backend_dev_t dev) {
-    // one repack buffer type per device, kept alive for the process
+// one repack buffer type per device, kept alive for the process
+static std::mutex & ggml_backend_cpu_repack_buffer_type_for_device_mutex() {
     static std::mutex mutex;
+    return mutex;
+}
+static std::vector<std::pair<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>>> & ggml_backend_cpu_repack_buffer_type_for_device_bufts() {
     static std::vector<std::pair<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>>> bufts;
+    return bufts;
+}
 
-    std::lock_guard<std::mutex> lock(mutex);
+ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_for_device(ggml_backend_dev_t dev) {
+    std::lock_guard<std::mutex> lock(ggml_backend_cpu_repack_buffer_type_for_device_mutex());
+    auto & bufts = ggml_backend_cpu_repack_buffer_type_for_device_bufts();
 
     for (const auto & [d, buft] : bufts) {
         if (d == dev) {
@@ -4895,4 +4902,20 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_for_device(ggml_b
 
     bufts.emplace_back(dev, std::move(buft));
     return bufts.back().second.get();
+}
+
+void ggml_backend_cpu_repack_buffer_type_forget_device(ggml_backend_dev_t dev) {
+    // for a device that is being destroyed without ever becoming visible (a failed --numa split
+    // initialization); otherwise the registry would keep a buffer type keyed by a dangling device
+    std::lock_guard<std::mutex> lock(ggml_backend_cpu_repack_buffer_type_for_device_mutex());
+    auto & bufts = ggml_backend_cpu_repack_buffer_type_for_device_bufts();
+
+    for (auto it = bufts.begin(); it != bufts.end(); ++it) {
+        if (it->first == dev) {
+            std::lock_guard<std::mutex> name_lock(ggml_backend_cpu_repack_buffer_type_mutex());
+            ggml_backend_cpu_repack_buffer_type_names().erase(it->second.get());
+            bufts.erase(it);
+            return;
+        }
+    }
 }

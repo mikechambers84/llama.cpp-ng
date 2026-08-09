@@ -13,6 +13,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 // a repack buffer type whose memory comes from dev, used to make repacked weights node local under --numa split
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_for_device(ggml_backend_dev_t dev);
 
+// drop the instance created for a device that never became visible (failed initialization)
+void ggml_backend_cpu_repack_buffer_type_forget_device(ggml_backend_dev_t dev);
+
 // true for the default repack buffer type and for any per device one
 bool ggml_backend_cpu_buft_is_repack(ggml_backend_buffer_type_t buft);
 

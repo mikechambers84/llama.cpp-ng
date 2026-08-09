@@ -474,7 +474,11 @@ ggml_backend_dev_t ggml_backend_get_device(ggml_backend_t backend) {
 
 void ggml_backend_set_n_threads_total(ggml_backend_t * backends, size_t n_backends, int n_threads) {
     GGML_ASSERT(backends);
-    GGML_ASSERT(n_threads > 0);
+
+    // n_threads <= 0 means "use the default", as elsewhere: keep the backends' current counts
+    if (n_threads <= 0) {
+        return;
+    }
 
     std::vector<ggml_backend_t>               bs;
     std::vector<ggml_backend_set_n_threads_t> set_fns;

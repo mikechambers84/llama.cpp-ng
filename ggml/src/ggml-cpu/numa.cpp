@@ -227,10 +227,13 @@ static bool touch_and_verify(void * addr, size_t len, int node_id, bool bound, s
 
     touch_pages((char *) addr, 0, len, stride);
 
-    // check the pages that were just faulted
+    // check a sample spread over the whole mapping, independent of how much was faulted above -
+    // sampling only the beginning would miss pages that landed elsewhere further in
+    const size_t vstride = std::max<size_t>(1, n_pages / 64) * ps;
+
     std::vector<void *> pages;
     std::vector<int>    status;
-    for (size_t off = 0; off < len && pages.size() < 64; off += stride) {
+    for (size_t off = 0; off < len && pages.size() < 64; off += vstride) {
         pages .push_back((char *) addr + off);
         status.push_back(-1);
     }
