@@ -8,6 +8,8 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -646,6 +648,90 @@ static ggml_backend_dev_t ggml_backend_cpu_reg_get_device(ggml_backend_reg_t reg
     return &ggml_backend_cpu_device;
 }
 
+// --numa split: expose every usable NUMA node as its own device.
+// Return values match enum llama_numa_init_status: 0 success, 1 unavailable, 2 failed.
+// Nothing is registered unless every node passes, so a failure leaves the registry untouched and a caller
+// that recovers from it never sees a half built configuration.
+static int ggml_backend_cpu_numa_split_init(void) {
+    static std::mutex mutex;
+    static int        status = -1;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (status >= 0) {
+        GGML_LOG_INFO("%s: NUMA already initialized\n", __func__);
+        return status;
+    }
+
+    const std::vector<ggml::cpu::numa::node> & nodes = ggml::cpu::numa::topology();
+
+    if (nodes.size() < 2) {
+        GGML_LOG_WARN("%s: --numa split needs 2 or more usable NUMA nodes (found %zu), continuing without NUMA optimizations\n",
+                __func__, nodes.size());
+        status = 1;
+        return status;
+    }
+
+    // phase 1: build and check every node, without registering anything
+    std::vector<std::unique_ptr<ggml_backend_cpu_device_context>> ctxs;
+    std::vector<std::unique_ptr<ggml_backend_device>>             devs;
+
+    for (const auto & node : nodes) {
+        auto ctx = std::make_unique<ggml_backend_cpu_device_context>();
+
+        ctx->numa_node   = node.id;
+        ctx->name        = "CPU" + std::to_string(node.id);
+        ctx->device_id   = "numa:" + std::to_string(node.id);
+        ctx->cpus        = node.cpus;
+        ctx->n_cores     = node.n_cores;
+        ctx->description = ctx->description + " (NUMA node " + std::to_string(node.id) + ")";
+
+        auto dev = std::make_unique<ggml_backend_device>();
+
+        dev->iface   = ggml_backend_cpu_device_i;
+        dev->reg     = ggml_backend_cpu_reg();
+        dev->context = ctx.get();
+
+        ggml_backend_cpu_numa_buffer_type_init(ctx.get(), dev.get());
+
+        // prove that this node can really hand out node local memory before anything depends on it
+        ggml_backend_buffer_t probe = ggml_backend_buft_alloc_buffer(&ctx->buft, 2u << 20);
+        if (probe == NULL) {
+            GGML_LOG_ERROR("%s: node %d cannot provide node local memory, --numa split is not available\n",
+                    __func__, node.id);
+            status = 2;
+            return status;
+        }
+        ggml_backend_buffer_free(probe);
+
+        GGML_LOG_INFO("%s: node %d: %zu CPUs, %d cores, %zu MiB\n",
+                __func__, node.id, node.cpus.size(), node.n_cores, node.mem_total >> 20);
+
+        ctxs.push_back(std::move(ctx));
+        devs.push_back(std::move(dev));
+    }
+
+    // phase 2: commit
+    static std::vector<std::unique_ptr<ggml_backend_cpu_device_context>> ctxs_registered;
+    static std::vector<std::unique_ptr<ggml_backend_device>>             devs_registered;
+
+    std::string names;
+    for (size_t i = 0; i < devs.size(); i++) {
+        ggml_backend_device_register(devs[i].get());
+
+        names += names.empty() ? "" : ", ";
+        names += ctxs[i]->name;
+
+        ctxs_registered.push_back(std::move(ctxs[i]));
+        devs_registered.push_back(std::move(devs[i]));
+    }
+
+    GGML_LOG_INFO("%s: registered devices: %s\n", __func__, names.c_str());
+
+    status = 0;
+    return status;
+}
+
 // This is intended to replace the the ggml_cpu_has_* functions when loading the CPU backend dynamically,
 // and additionally to allow other backends to expose their own list of features that applications can query using the same API
 static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t reg) {
@@ -785,6 +871,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_split_init") == 0) {
+        return (void *)ggml_backend_cpu_numa_split_init;
     }
     if (strcmp(name, "ggml_backend_dev_get_numa_node") == 0) {
         return (void *)ggml_backend_cpu_device_get_numa_node;

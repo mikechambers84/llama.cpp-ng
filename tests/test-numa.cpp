@@ -5,6 +5,7 @@
 #include "../ggml/src/ggml-cpu/numa.h"
 
 #include "ggml-backend.h"
+#include "llama.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -192,6 +193,71 @@ int main() {
 
             auto n_threads_max_fn = (ggml_backend_dev_get_n_threads_max_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_n_threads_max");
             check(n_threads_max_fn != nullptr && n_threads_max_fn(cpu) == 0, "no thread limit of its own");
+        }
+    }
+
+    // must run last, it changes the registry
+    printf("numa split registration\n");
+    {
+        const size_t n_dev_before = ggml_backend_dev_count();
+
+        const llama_numa_init_status status = llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT);
+
+        if (topology().size() < 2) {
+            check(status == LLAMA_NUMA_INIT_STATUS_UNAVAILABLE, "unavailable with fewer than 2 nodes");
+            check(ggml_backend_dev_count() == n_dev_before, "no devices registered");
+        } else {
+            check(status == LLAMA_NUMA_INIT_STATUS_SUCCESS, "split initialized");
+            check(ggml_backend_dev_count() == n_dev_before + topology().size(), "one device per node registered");
+
+            // the device that was there before must still be the one everything falls back to
+            ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            check(std::string(ggml_backend_dev_name(cpu)) == "CPU", "dev_by_type still returns the plain CPU device");
+
+            ggml_backend_reg_t reg           = ggml_backend_dev_backend_reg(cpu);
+            auto               numa_node_fn  = (ggml_backend_dev_get_numa_node_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_numa_node");
+            auto               n_threads_fn  = (ggml_backend_dev_get_n_threads_max_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_n_threads_max");
+
+            for (const auto & n : topology()) {
+                const std::string  expected = "CPU" + std::to_string(n.id);
+                ggml_backend_dev_t dev      = ggml_backend_dev_by_name(expected.c_str());
+
+                check(dev != nullptr, expected + " is registered");
+                if (dev == nullptr) {
+                    continue;
+                }
+
+                check(ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU, expected + " is a CPU device");
+                check(numa_node_fn(dev) == n.id, expected + " reports its node");
+                check(n_threads_fn(dev) == (int) n.cpus.size(), expected + " reports its thread capacity");
+
+                ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+                check(std::string(ggml_backend_buft_name(buft)) == expected, expected + " has its own buffer type");
+                check(ggml_backend_buft_get_device(buft) == dev, expected + " buffer type points back at it");
+                check(ggml_backend_buft_is_host(buft), expected + " buffer type is host memory");
+
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                check(!props.caps.buffer_from_host_ptr, expected + " does not map host pointers");
+                check(props.memory_total > 0 && props.memory_total < (size_t) -1, expected + " reports node memory");
+
+                // no node device may accept the buffers of another node
+                for (const auto & other : topology()) {
+                    if (other.id == n.id) {
+                        continue;
+                    }
+                    const std::string other_name = "CPU" + std::to_string(other.id);
+                    ggml_backend_dev_t other_dev = ggml_backend_dev_by_name(other_name.c_str());
+                    check(!ggml_backend_dev_supports_buft(dev, ggml_backend_dev_buffer_type(other_dev)),
+                            expected + " rejects the buffer type of " + other_name);
+                }
+
+                // the fallback device still takes everything
+                check(ggml_backend_dev_supports_buft(cpu, buft), "the plain CPU device accepts " + expected + " buffers");
+            }
+
+            check(llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_SUCCESS, "second call is idempotent");
+            check(ggml_backend_dev_count() == n_dev_before + topology().size(), "and registers nothing more");
         }
     }
 

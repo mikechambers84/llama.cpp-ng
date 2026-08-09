@@ -470,7 +470,16 @@ extern "C" {
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 
+    enum llama_numa_init_status {
+        LLAMA_NUMA_INIT_STATUS_SUCCESS     = 0, // the requested strategy is in effect
+        LLAMA_NUMA_INIT_STATUS_UNAVAILABLE = 1, // not supported on this system, NUMA is left disabled
+        LLAMA_NUMA_INIT_STATUS_FAILED      = 2, // initialization was attempted and failed, see the log
+    };
+
     //optional:
+    LLAMA_API enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa);
+
+    // same, but aborts instead of reporting a failure, since it cannot return one
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
     // Optional: an auto threadpool gets created in ggml if not passed explicitly

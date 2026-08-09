@@ -126,15 +126,38 @@ void llama_backend_init(void) {
     }
 }
 
-void llama_numa_init(enum ggml_numa_strategy numa) {
-    if (numa != GGML_NUMA_STRATEGY_DISABLED) {
-        auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        GGML_ASSERT(dev && "CPU backend is not loaded");
-        auto * reg = ggml_backend_dev_backend_reg(dev);
-        auto * numa_init_fn = (decltype(ggml_numa_init) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init");
-        if (numa_init_fn) {
-            numa_init_fn(numa);
+enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
+    if (numa == GGML_NUMA_STRATEGY_DISABLED) {
+        return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+    }
+
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(dev && "CPU backend is not loaded");
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+
+    // split does not go through ggml_numa_init: it must not turn on the global thread affinity handling,
+    // which would override the per node thread pools on every graph
+    if (numa == GGML_NUMA_STRATEGY_SPLIT) {
+        auto * split_init_fn = (int (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_split_init");
+        if (split_init_fn == nullptr) {
+            LLAMA_LOG_WARN("%s: --numa split is not supported by this build, continuing without NUMA optimizations\n", __func__);
+            return LLAMA_NUMA_INIT_STATUS_UNAVAILABLE;
         }
+        return (enum llama_numa_init_status) split_init_fn();
+    }
+
+    auto * numa_init_fn = (decltype(ggml_numa_init) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init");
+    if (numa_init_fn) {
+        numa_init_fn(numa);
+    }
+
+    return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+}
+
+void llama_numa_init(enum ggml_numa_strategy numa) {
+    if (llama_numa_init_ex(numa) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+        // llama_numa_init_ex has already logged the reason
+        GGML_ABORT("llama_numa_init: failed to initialize the requested NUMA strategy");
     }
 }
 
