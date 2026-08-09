@@ -1156,6 +1156,94 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+// CPU backend - native allreduce between NUMA node backends
+//
+// The Meta backend reduces the partial results of every tensor-parallel boundary, preferring a
+// backend-native allreduce (this) over its generic fallback, which builds the reduction out of
+// cross-backend copies and ADD ops and pays several dispatcher round trips per boundary. CPU node
+// backends share one address space, so small tensors are cheaper to reduce right here on the
+// calling thread: wait for the partials, one pass over the data, done. Batch-1 decode reduces a
+// few tens of KiB per boundary, where the fallback's fixed dispatch cost dominates the token time.
+
+// prompt-sized boundary tensors are reduced faster by the fallback, whose ADDs run on the node
+// thread pools; a single thread only wins while the data is small (see the bench in the M9 commit)
+static const size_t GGML_CPU_COMM_MAX_BYTES = 1024*1024;
+
+struct ggml_backend_cpu_comm {
+    std::vector<ggml_backend_t> backends;
+};
+
+static void * ggml_backend_cpu_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    if (n_backends < 2) {
+        return NULL;
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        // only between NUMA node backends, whose buffers are all in one address space
+        if (!ggml_backend_is_cpu(backends[j]) || ggml_backend_cpu_device_get_numa_node(backends[j]->device) < 0) {
+            return NULL;
+        }
+    }
+
+    struct ggml_backend_cpu_comm * comm = new ggml_backend_cpu_comm;
+    comm->backends.assign(backends, backends + n_backends);
+    return comm;
+}
+
+static bool ggml_backend_cpu_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors) {
+    struct ggml_backend_cpu_comm * comm = (struct ggml_backend_cpu_comm *)comm_ctx;
+    const size_t n_backends = comm->backends.size();
+
+    const size_t nbytes = ggml_nbytes(tensors[0]);
+    if (nbytes > GGML_CPU_COMM_MAX_BYTES) {
+        return false;
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        if (tensors[j]->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensors[j]) || ggml_nbytes(tensors[j]) != nbytes) {
+            return false;
+        }
+    }
+
+    // the partials were dispatched to the backends just before this call
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_synchronize(comm->backends[j]);
+    }
+
+    // sum the partials of the backends that computed one (a backend whose slice of the producing
+    // matmul was empty leaves garbage in its tensor), then give every backend the sum
+    const int64_t ne  = ggml_nelements(tensors[0]);
+    float *       acc = NULL;
+    for (size_t j = 0; j < n_backends; j++) {
+        if ((tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        float * data = (float *)tensors[j]->data;
+        if (acc == NULL) {
+            acc = data;
+        } else {
+            for (int64_t i = 0; i < ne; i++) {
+                acc[i] += data[i];
+            }
+        }
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        float * data = (float *)tensors[j]->data;
+        if (data == acc) {
+            continue;
+        }
+        if (acc != NULL) {
+            memcpy(data, acc, nbytes);
+        } else {
+            memset(data, 0, nbytes);
+        }
+    }
+
+    return true;
+}
+
+static void ggml_backend_cpu_comm_free(void * comm_ctx) {
+    delete (struct ggml_backend_cpu_comm *)comm_ctx;
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -1188,6 +1276,18 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        ggml_backend_comm_init_t fct = ggml_backend_cpu_comm_init;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        ggml_backend_comm_allreduce_tensor_t fct = ggml_backend_cpu_comm_allreduce_tensor;
+        return (void *)fct;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        ggml_backend_comm_free_t fct = ggml_backend_cpu_comm_free;
+        return (void *)fct;
     }
 
     // threadpool - TODO:  move to ggml-base
