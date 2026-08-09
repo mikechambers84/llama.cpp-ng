@@ -541,7 +541,9 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
 static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu_device_context * ctx) {
     struct ggml_threadpool_params tpp;
 
-    ggml_threadpool_params_init(&tpp, (int) ctx->cpus.size());
+    // one thread per physical core: extra threads would spend the poll window spinning on the SMT
+    // siblings of the compute threads, and the budget never assigns more than the core count anyway
+    ggml_threadpool_params_init(&tpp, ctx->n_cores > 0 ? ctx->n_cores : (int) ctx->cpus.size());
 
     for (int cpu : ctx->cpus) {
         if (cpu < GGML_MAX_N_THREADS) {

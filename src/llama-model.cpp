@@ -1348,6 +1348,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
+    // ... unless the first device is a NUMA node, which is also host memory. keeping the input layer on the
+    // fallback CPU backend would wake its thread pool once per token for one small op, and its threads then
+    // spin on the cores the node backends compute on, which costs far more than the op itself
+    if (!devices.empty() && llama_dev_numa_node(devices[0].dev) >= 0) {
+        pimpl->dev_input = { devices[0].dev, &pimpl->gpu_buft_list.at(devices[0].dev) };
+    }
+
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
