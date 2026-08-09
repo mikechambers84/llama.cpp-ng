@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "ggml-backend.h"
 
 #include <string>
 #include <type_traits>
@@ -103,3 +104,6 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+
+// NUMA node a device is bound to, -1 if it is not one of the --numa split devices
+int llama_dev_numa_node(ggml_backend_dev_t dev);

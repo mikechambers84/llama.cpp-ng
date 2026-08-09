@@ -359,6 +359,9 @@ private:
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 
+    // --numa split devices, they share the thread budget instead of each taking all of it
+    std::vector<ggml_backend_t> backends_numa;
+
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;

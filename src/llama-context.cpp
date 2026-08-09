@@ -359,7 +359,12 @@ llama_context::llama_context(
             if (reg) {
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
-                    set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                    // the NUMA node backends run at the same time, so they split one thread budget between them
+                    if (backend.get() != backend_cpu && llama_dev_numa_node(dev) >= 0) {
+                        backends_numa.emplace_back(backend.get());
+                    } else {
+                        set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                    }
                 }
             }
         }
@@ -2469,6 +2474,10 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    if (!backends_numa.empty()) {
+        ggml_backend_set_n_threads_total(backends_numa.data(), backends_numa.size(), n_threads);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

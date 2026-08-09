@@ -169,3 +169,14 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
 }
+
+int llama_dev_numa_node(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return -1;
+    }
+
+    auto * fn = (ggml_backend_dev_get_numa_node_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_numa_node");
+
+    return fn ? fn(dev) : -1;
+}

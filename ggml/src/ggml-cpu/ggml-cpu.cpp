@@ -7,6 +7,7 @@
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
+#include <algorithm>
 #include <cctype>
 #include <memory>
 #include <mutex>
@@ -99,9 +100,14 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 
 // CPU backend - backend (stream)
 
+static int ggml_backend_cpu_device_get_n_threads_max(ggml_backend_dev_t dev);
+
 struct ggml_backend_cpu_context {
     int                 n_threads;
     ggml_threadpool_t   threadpool;
+
+    // owned by a NUMA node backend, it is pinned to the CPUs of that node
+    ggml_threadpool_t   own_threadpool;
 
     uint8_t *           work_data;
     size_t              work_size;
@@ -112,6 +118,10 @@ struct ggml_backend_cpu_context {
     bool                use_ref;  // use reference implementation
 };
 
+static ggml_threadpool_t ggml_backend_cpu_threadpool(const struct ggml_backend_cpu_context * ctx) {
+    return ctx->threadpool != NULL ? ctx->threadpool : ctx->own_threadpool;
+}
+
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
     return "CPU";
 
@@ -120,6 +130,9 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    if (cpu_ctx->own_threadpool != NULL) {
+        ggml_threadpool_free(cpu_ctx->own_threadpool);
+    }
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
     delete backend;
@@ -135,7 +148,7 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
 
     struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
 
-    cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, ggml_backend_cpu_threadpool(cpu_ctx));
     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
 
     if (cpu_plan->cplan.work_size > 0) {
@@ -173,7 +186,7 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, ggml_backend_cpu_threadpool(cpu_ctx));
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -228,6 +241,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
 
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->threadpool          = NULL;
+    ctx->own_threadpool      = NULL;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
@@ -257,6 +271,13 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+
+    // a node backend cannot use more threads than its node has CPUs
+    const int n_threads_max = ggml_backend_cpu_device_get_n_threads_max(backend_cpu->device);
+    if (n_threads_max > 0) {
+        n_threads = std::min(n_threads, n_threads_max);
+    }
+
     ctx->n_threads = n_threads;
 }
 
@@ -494,10 +515,48 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
     };
 }
 
+// a thread pool restricted to the CPUs of one node. it is created paused so that the affinity is applied
+// to whichever thread ends up driving the graph, not to the thread that happens to build the backend
+static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu_device_context * ctx) {
+    struct ggml_threadpool_params tpp;
+
+    ggml_threadpool_params_init(&tpp, (int) ctx->cpus.size());
+
+    for (int cpu : ctx->cpus) {
+        if (cpu < GGML_MAX_N_THREADS) {
+            tpp.cpumask[cpu] = true;
+        }
+    }
+
+    // several of these pools exist at once, workers that are not computing must not spin
+    tpp.poll   = 0;
+    tpp.paused = true;
+
+    return ggml_threadpool_new(&tpp);
+}
+
 static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
+    struct ggml_backend_cpu_device_context * dev_ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+
     ggml_backend_t backend = ggml_backend_cpu_init();
-    if (backend != NULL) {
-        backend->device = dev;
+    if (backend == NULL) {
+        return NULL;
+    }
+
+    backend->device = dev;
+
+    if (dev_ctx->numa_node >= 0) {
+        struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+        ctx->own_threadpool = ggml_backend_cpu_numa_threadpool(dev_ctx);
+        if (ctx->own_threadpool == NULL) {
+            GGML_LOG_ERROR("%s: failed to create the thread pool of %s\n", __func__, dev_ctx->name.c_str());
+            ggml_backend_free(backend);
+            return NULL;
+        }
+
+        // one thread per physical core until a thread count is set
+        ctx->n_threads = dev_ctx->n_cores;
     }
 
     return backend;
