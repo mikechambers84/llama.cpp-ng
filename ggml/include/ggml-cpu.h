@@ -38,6 +38,21 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // GGML_NUMA_STRATEGY_SPLIT initialization, reached through the CPU reg proc address
+    // "ggml_backend_cpu_numa_split_init". It creates one CPU device per usable NUMA node and hands
+    // them back for the caller to register (a backend does not link against the device registry).
+    // On entry *n_devices is the capacity of devices, on return the number handed out - 0 on every
+    // call after the first, so the devices cannot be registered twice.
+    enum ggml_numa_split_status {
+        GGML_NUMA_SPLIT_STATUS_SUCCESS     = 0, // the devices were created (or already had been)
+        GGML_NUMA_SPLIT_STATUS_UNAVAILABLE = 1, // not supported on this system, nothing was created
+        GGML_NUMA_SPLIT_STATUS_FAILED      = 2, // initialization failed, the reason was logged
+    };
+    // more nodes than this are capped with a warning; the backend scheduler holds at most 16
+    // backends, and the fallback CPU backend and a possible ACCEL/BLAS backend need slots too
+    #define GGML_CPU_NUMA_SPLIT_MAX_DEVICES 14
+    typedef enum ggml_numa_split_status (*ggml_backend_cpu_numa_split_init_t)(ggml_backend_dev_t * devices, size_t * n_devices);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 

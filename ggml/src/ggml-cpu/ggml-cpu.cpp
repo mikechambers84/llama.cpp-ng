@@ -1013,16 +1013,12 @@ static ggml_backend_dev_t ggml_backend_cpu_reg_get_device(ggml_backend_reg_t reg
 }
 
 // --numa split: expose every usable NUMA node as its own device.
-// Return values match enum llama_numa_init_status: 0 success, 1 unavailable, 2 failed.
-// Nothing is registered unless every node passes, so a failure leaves the registry untouched and a caller
-// that recovers from it never sees a half built configuration.
-// The devices are handed back through devices/n_devices for the caller to register: a backend
-// cannot depend on the registry, which lives above ggml-base. On entry *n_devices is the capacity
-// of devices; on return it is the number of devices handed out, which is 0 on every call after
-// the first so that they cannot be registered twice.
-static int ggml_backend_cpu_numa_split_init(ggml_backend_dev_t * devices, size_t * n_devices) {
+// See the contract next to ggml_numa_split_status in ggml-cpu.h. Nothing externally visible is
+// created unless every node passes, so a failure leaves everything untouched and a caller that
+// recovers from it never sees a half built configuration.
+static enum ggml_numa_split_status ggml_backend_cpu_numa_split_init(ggml_backend_dev_t * devices, size_t * n_devices) {
     static std::mutex mutex;
-    static int        status = -1;
+    static int        status = -1; // latched ggml_numa_split_status after the first call
 
     std::lock_guard<std::mutex> lock(mutex);
 
@@ -1031,23 +1027,25 @@ static int ggml_backend_cpu_numa_split_init(ggml_backend_dev_t * devices, size_t
 
     if (status >= 0) {
         GGML_LOG_INFO("%s: NUMA already initialized\n", __func__);
-        return status;
+        return (enum ggml_numa_split_status) status;
     }
 
-    const std::vector<ggml::cpu::numa::node> & nodes = ggml::cpu::numa::topology();
+    std::vector<ggml::cpu::numa::node> nodes = ggml::cpu::numa::topology();
 
     if (nodes.size() < 2) {
         GGML_LOG_WARN("%s: --numa split needs 2 or more usable NUMA nodes (found %zu), continuing without NUMA optimizations\n",
                 __func__, nodes.size());
-        status = 1;
-        return status;
+        status = GGML_NUMA_SPLIT_STATUS_UNAVAILABLE;
+        return (enum ggml_numa_split_status) status;
     }
 
-    if (nodes.size() > capacity) {
-        GGML_LOG_ERROR("%s: %zu NUMA nodes exceed the supported maximum of %zu devices\n",
-                __func__, nodes.size(), capacity);
-        status = 2;
-        return status;
+    // a machine with more nodes than the backend scheduler can hold is still usable with the
+    // first nodes; the cap is never silent
+    const size_t max_devices = std::min(capacity, (size_t) GGML_CPU_NUMA_SPLIT_MAX_DEVICES);
+    if (nodes.size() > max_devices) {
+        GGML_LOG_WARN("%s: found %zu NUMA nodes but at most %zu devices are supported, using the first %zu nodes\n",
+                __func__, nodes.size(), max_devices, max_devices);
+        nodes.resize(max_devices);
     }
 
     // phase 1: build and check every node, without registering anything
@@ -1077,8 +1075,8 @@ static int ggml_backend_cpu_numa_split_init(ggml_backend_dev_t * devices, size_t
         if (probe == NULL) {
             GGML_LOG_ERROR("%s: node %d cannot provide node local memory, --numa split is not available\n",
                     __func__, node.id);
-            status = 2;
-            return status;
+            status = GGML_NUMA_SPLIT_STATUS_FAILED;
+            return (enum ggml_numa_split_status) status;
         }
         ggml_backend_buffer_free(probe);
 
@@ -1107,8 +1105,8 @@ static int ggml_backend_cpu_numa_split_init(ggml_backend_dev_t * devices, size_t
 
     GGML_LOG_INFO("%s: devices: %s\n", __func__, names.c_str());
 
-    status = 0;
-    return status;
+    status = GGML_NUMA_SPLIT_STATUS_SUCCESS;
+    return (enum ggml_numa_split_status) status;
 }
 
 // This is intended to replace the the ggml_cpu_has_* functions when loading the CPU backend dynamically,

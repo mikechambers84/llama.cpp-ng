@@ -138,7 +138,7 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
     // split does not go through ggml_numa_init: it must not turn on the global thread affinity handling,
     // which would override the per node thread pools on every graph
     if (numa == GGML_NUMA_STRATEGY_SPLIT) {
-        auto * split_init_fn = (int (*)(ggml_backend_dev_t *, size_t *))
+        auto * split_init_fn = (ggml_backend_cpu_numa_split_init_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_split_init");
         if (split_init_fn == nullptr) {
             LLAMA_LOG_WARN("%s: --numa split is not supported by this build, continuing without NUMA optimizations\n", __func__);
@@ -148,14 +148,20 @@ enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
         // the CPU backend creates the node devices but cannot register them itself (a backend
         // does not link against the registry), so they are registered here. calls after the
         // first return no devices, so the registration cannot happen twice
-        ggml_backend_dev_t node_devs[16];
+        ggml_backend_dev_t node_devs[GGML_CPU_NUMA_SPLIT_MAX_DEVICES];
         size_t             n_node_devs = sizeof(node_devs)/sizeof(node_devs[0]);
 
-        const auto status = (enum llama_numa_init_status) split_init_fn(node_devs, &n_node_devs);
+        const enum ggml_numa_split_status status = split_init_fn(node_devs, &n_node_devs);
         for (size_t i = 0; i < n_node_devs; i++) {
             ggml_backend_device_register(node_devs[i]);
         }
-        return status;
+
+        switch (status) {
+            case GGML_NUMA_SPLIT_STATUS_SUCCESS:     return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+            case GGML_NUMA_SPLIT_STATUS_UNAVAILABLE: return LLAMA_NUMA_INIT_STATUS_UNAVAILABLE;
+            case GGML_NUMA_SPLIT_STATUS_FAILED:      return LLAMA_NUMA_INIT_STATUS_FAILED;
+        }
+        GGML_ABORT("invalid numa split status");
     }
 
     auto * numa_init_fn = (decltype(ggml_numa_init) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init");
