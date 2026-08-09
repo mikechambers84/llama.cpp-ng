@@ -1354,7 +1354,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // ... unless the first device is a NUMA node, which is also host memory. keeping the input layer on the
     // fallback CPU backend would wake its thread pool once per token for one small op, and its threads then
     // spin on the cores the node backends compute on, which costs far more than the op itself
-    if (!devices.empty() && llama_dev_numa_node(devices[0].dev) >= 0) {
+    if (!devices.empty() && act_gpu_layers > 0 && llama_dev_numa_node(devices[0].dev) >= 0) {
         pimpl->dev_input = { devices[0].dev, &pimpl->gpu_buft_list.at(devices[0].dev) };
     }
 
@@ -1624,6 +1624,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            if (use_mlock && !ggml_backend_buffer_is_host(buf)) {
+                // e.g. a meta buffer of a tensor split, whose shards have no single base address
+                LLAMA_LOG_WARN("%s: --mlock does not cover the %s buffer\n",
+                        __func__, ggml_backend_buffer_name(buf));
             }
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
