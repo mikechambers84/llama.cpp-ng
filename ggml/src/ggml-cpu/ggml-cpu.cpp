@@ -819,6 +819,12 @@ static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu
     // the pools are pinned to disjoint CPU sets, so an idle pool does not take cores from a busy one
     tpp.paused = true;
 
+    // one worker per CPU while the pool fits on distinct physical cores: floating workers can be
+    // co-scheduled onto SMT siblings while a core idles, which straggles every barrier (measured
+    // ~6% of tg). once the pool spills onto SMT siblings anyway, the fixed assignment loads the
+    // cores unevenly and letting the scheduler balance within the node is slightly better
+    tpp.strict_cpu = n_threads <= ctx->n_cores;
+
     return ggml_threadpool_new(&tpp);
 }
 
