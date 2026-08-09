@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "numa.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -289,6 +290,13 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 struct ggml_backend_cpu_device_context {
     std::string description = "CPU";
 
+    // set only for the per-node devices created by --numa split, see ggml_backend_cpu_numa_split_init
+    int              numa_node = -1;
+    std::string      name      = "CPU";
+    std::string      device_id;
+    std::vector<int> cpus;
+    int              n_cores = 0;
+
     ggml_backend_cpu_device_context() {
 #ifdef __APPLE__
         size_t len = 0;
@@ -351,9 +359,9 @@ struct ggml_backend_cpu_device_context {
 };
 
 static const char * ggml_backend_cpu_device_get_name(ggml_backend_dev_t dev) {
-    return "CPU";
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
 
-    GGML_UNUSED(dev);
+    return ctx->name.c_str();
 }
 
 static const char * ggml_backend_cpu_device_get_description(ggml_backend_dev_t dev) {
@@ -363,6 +371,19 @@ static const char * ggml_backend_cpu_device_get_description(ggml_backend_dev_t d
 }
 
 static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+
+    if (ctx->numa_node >= 0) {
+        ggml::cpu::numa::node n;
+        n.id = ctx->numa_node;
+        ggml::cpu::numa::refresh_memory(n);
+
+        // as below, report all of the memory as free
+        *total = n.mem_total;
+        *free  = n.mem_total;
+        return;
+    }
+
 #ifdef _WIN32
     MEMORYSTATUSEX status;
     status.dwLength = sizeof(status);
@@ -388,22 +409,30 @@ static enum ggml_backend_dev_type ggml_backend_cpu_device_get_type(ggml_backend_
 }
 
 static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+
     props->name        = ggml_backend_cpu_device_get_name(dev);
     props->description = ggml_backend_cpu_device_get_description(dev);
     props->type        = ggml_backend_cpu_device_get_type(dev);
+    props->device_id   = ctx->numa_node < 0 ? nullptr : ctx->device_id.c_str();
     ggml_backend_cpu_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ false,
-        /* .buffer_from_host_ptr  = */ true,
+        // a node device must not map file pages, its buffers have to be bound to the node
+        /* .buffer_from_host_ptr  = */ ctx->numa_node < 0,
         /* .events                = */ false,
     };
 }
 
 static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    return ggml_backend_cpu_init();
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (backend != NULL) {
+        backend->device = dev;
+    }
 
-    GGML_UNUSED(dev);
+    return backend;
+
     GGML_UNUSED(params);
 }
 
@@ -418,6 +447,19 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 
     GGML_UNUSED(dev);
     GGML_UNUSED(max_tensor_size);
+}
+
+static int ggml_backend_cpu_device_get_numa_node(ggml_backend_dev_t dev) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+
+    return ctx->numa_node;
+}
+
+static int ggml_backend_cpu_device_get_n_threads_max(ggml_backend_dev_t dev) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+
+    // only a node device is limited to a subset of the machine
+    return ctx->numa_node < 0 ? 0 : (int) ctx->cpus.size();
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -477,8 +519,15 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 }
 
 static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
+
+    if (ctx->numa_node >= 0) {
+        // a node device only takes its own buffers, otherwise the scheduler would give it the tensors of
+        // another node, which it would then compute on remote memory
+        return buft == ggml_backend_dev_buffer_type(dev) || ggml_backend_cpu_is_extra_buffer_type(buft);
+    }
+
     return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
-    GGML_UNUSED(dev);
 }
 
 static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
@@ -665,6 +714,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_numa_node") == 0) {
+        return (void *)ggml_backend_cpu_device_get_numa_node;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_n_threads_max") == 0) {
+        return (void *)ggml_backend_cpu_device_get_n_threads_max;
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;

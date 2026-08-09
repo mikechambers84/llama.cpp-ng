@@ -215,6 +215,8 @@ extern "C" {
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get the maximum number of threads the device can use (0 if not applicable)
     typedef int                          (*ggml_backend_dev_get_n_threads_max_t)(ggml_backend_dev_t device);
+    // Get the NUMA node the device is bound to, -1 if it is not bound to one
+    typedef int                          (*ggml_backend_dev_get_numa_node_t)(ggml_backend_dev_t device);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
