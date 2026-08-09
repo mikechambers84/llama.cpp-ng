@@ -704,12 +704,10 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 // CLI argument parsing functions
 //
 
-static void common_params_numa_prescan(int argc, char ** argv);
+static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value);
 
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
-
-    common_params_numa_prescan(argc, argv);
 
     // setup log directly from params.verbosity: see tools/cli/cli.cpp
     common_log_set_verbosity_thold(params.verbosity);
@@ -839,6 +837,38 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    // devices and tensor buffer overrides resolve only now: under --numa split the node devices
+    // exist only after initialization, and this way the arguments work in any order. skipped for
+    // usage/completion, which exit without using them
+    if (!params.usage && !params.completion) {
+        if (params.numa == GGML_NUMA_STRATEGY_SPLIT) {
+            // the CPU backend is a shared library in some builds, it has to be loaded before it can be asked
+            ggml_backend_load_all();
+            if (llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+                throw std::runtime_error("--numa split could not be initialized");
+            }
+        }
+
+        if (!params.devices_arg.empty()) {
+            params.devices = parse_device_list(params.devices_arg);
+        }
+        if (!params.speculative.draft.devices_arg.empty()) {
+            params.speculative.draft.devices = parse_device_list(params.speculative.draft.devices_arg);
+        }
+        for (const auto & spec : params.tensor_buft_override_specs) {
+            parse_tensor_buffer_overrides(spec, params.tensor_buft_overrides);
+        }
+        for (const auto & spec : params.speculative.draft.tensor_buft_override_specs) {
+            parse_tensor_buffer_overrides(spec, params.speculative.draft.tensor_buft_overrides);
+        }
+
+        if (params.list_devices) {
+            common_print_available_devices();
+            exit(0);
+        }
+    }
+
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -1056,33 +1086,6 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
 
     for (const auto& exe : executables) {
         printf("complete -F _llama_completions %s\n", exe.c_str());
-    }
-}
-
-// --numa split registers one device per NUMA node, and -dev, -ot and --list-devices all resolve devices while
-// the arguments are still being read. The value is therefore looked up here first, so that those work whatever
-// order the arguments are given in. Registration is idempotent, the later llama_numa_init does nothing.
-static void common_params_numa_prescan(int argc, char ** argv) {
-    std::string value;
-
-    if (const char * env = std::getenv("LLAMA_ARG_NUMA")) {
-        value = env;
-    }
-    for (int i = 1; i + 1 < argc; i++) {
-        if (std::strcmp(argv[i], "--numa") == 0) {
-            value = argv[i + 1];
-        }
-    }
-
-    if (value != "split") {
-        return;
-    }
-
-    // the CPU backend is a shared library in some builds, it has to be loaded before it can be asked
-    ggml_backend_load_all();
-
-    if (llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_FAILED) {
-        throw std::runtime_error("--numa split could not be initialized");
     }
 }
 
@@ -2675,28 +2678,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
-            params.devices = parse_device_list(value);
+            // resolved after parsing, the available devices can depend on other arguments (--numa split)
+            params.devices_arg = value;
         }
     ).set_env("LLAMA_ARG_DEVICE"));
     add_opt(common_arg(
         {"--list-devices"},
         "print list of available devices and exit",
-        [](common_params &) {
-            common_print_available_devices();
-            exit(0);
+        [](common_params & params) {
+            // printed after parsing so that the list reflects --numa split in any argument order
+            params.list_devices = true;
         }
     ));
     add_opt(common_arg(
         {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type", [](common_params & params, const std::string & value) {
-            parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
+            // resolved after parsing, the available buffer types can depend on other arguments (--numa split)
+            params.tensor_buft_override_specs.push_back(value);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {
-            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            params.tensor_buft_override_specs.push_back(std::string(LLM_FFN_EXPS_REGEX) + "=CPU");
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
@@ -2707,10 +2712,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             for (int i = 0; i < value; ++i) {
-                // keep strings alive and avoid leaking memory by storing them in a static vector
-                static std::list<std::string> buft_overrides;
-                buft_overrides.push_back(llm_ffn_exps_block_regex(i));
-                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type()});
+                params.tensor_buft_override_specs.push_back(llm_ffn_exps_block_regex(i) + "=CPU");
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
@@ -4010,14 +4012,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
-            parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
+            params.speculative.draft.tensor_buft_override_specs.push_back(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-cpu-moe", "-cmoed", "--cpu-moe-draft"},
         "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
         [](common_params & params) {
-            params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            params.speculative.draft.tensor_buft_override_specs.push_back(std::string(LLM_FFN_EXPS_REGEX) + "=CPU");
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
     add_opt(common_arg(
@@ -4028,9 +4030,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             for (int i = 0; i < value; ++i) {
-                static std::list<std::string> buft_overrides_draft;
-                buft_overrides_draft.push_back(llm_ffn_exps_block_regex(i));
-                params.speculative.draft.tensor_buft_overrides.push_back({buft_overrides_draft.back().c_str(), ggml_backend_cpu_buffer_type()});
+                params.speculative.draft.tensor_buft_override_specs.push_back(llm_ffn_exps_block_regex(i) + "=CPU");
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
@@ -4078,7 +4078,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.devices = parse_device_list(value);
+            params.speculative.draft.devices_arg = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     GGML_ASSERT(params.speculative.draft.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

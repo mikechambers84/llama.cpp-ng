@@ -10,6 +10,7 @@
 #include <cstring>
 #include <ctime>
 #include <iterator>
+#include <list>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -141,28 +142,6 @@ static std::string get_gpu_info() {
     return join(gpu_list, ", ");
 }
 
-// see common_params_numa_prescan, the NUMA devices have to exist before -dev is resolved
-static void numa_prescan(int argc, char ** argv) {
-    std::string value;
-
-    for (int i = 1; i + 1 < argc; i++) {
-        if (std::strcmp(argv[i], "--numa") == 0) {
-            value = argv[i + 1];
-        }
-    }
-
-    if (value != "split") {
-        return;
-    }
-
-    ggml_backend_load_all();
-
-    if (llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_FAILED) {
-        fprintf(stderr, "error: --numa split could not be initialized\n");
-        exit(1);
-    }
-}
-
 static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & value) {
     std::vector<ggml_backend_dev_t> devices;
     std::string                     trimmed = string_strip(value);
@@ -194,6 +173,85 @@ static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & val
 
     devices.push_back(nullptr);
     return devices;
+}
+
+
+// parses one -ot value ("pattern=BUFT;pattern=BUFT,pattern=BUFT,..."), one override group per
+// comma-separated span. returns false after printing the reason on a parse error
+static bool parse_ot_arg(const std::string & value_in, std::vector<std::vector<llama_model_tensor_buft_override>> & out) {
+    std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+    // enumerate all the devices and add their buffer types to the list
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * buft = ggml_backend_dev_buffer_type(dev);
+        if (buft) {
+            buft_list[ggml_backend_buft_name(buft)] = buft;
+        }
+    }
+
+    // the overrides keep pointers into the parsed string (null terminators are stamped in place),
+    // so it lives here for the lifetime of the process
+    static std::list<std::string> stored;
+    stored.push_back(value_in);
+    char * value = stored.back().data();
+
+    auto override_group_span_len = std::strcspn(value, ",");
+    bool last_group = false;
+    do {
+        if (override_group_span_len == 0) {
+            // Adds an empty override-tensors for an empty span
+            out.push_back({{}});
+            if (value[override_group_span_len] == '\0') {
+                value = &value[override_group_span_len];
+                last_group = true;
+            } else {
+                value = &value[override_group_span_len + 1];
+                override_group_span_len = std::strcspn(value, ",");
+            }
+            continue;
+        }
+        auto * override_group = value;
+        if (value[override_group_span_len] == '\0') {
+            value = &value[override_group_span_len];
+            last_group = true;
+        } else {
+            value[override_group_span_len] = '\0';
+            value = &value[override_group_span_len + 1];
+        }
+        std::vector<llama_model_tensor_buft_override> group_tensor_buft_overrides{};
+        auto override_span_len = std::strcspn(override_group, ";");
+        while (override_span_len > 0) {
+            auto * override = override_group;
+            if (override_group[override_span_len] != '\0') {
+                override_group[override_span_len] = '\0';
+                override_group = &override_group[override_span_len + 1];
+            } else {
+                override_group = &override_group[override_span_len];
+            }
+            auto tensor_name_span_len = std::strcspn(override, "=");
+            if (tensor_name_span_len >= override_span_len) {
+                return false;
+            }
+            override[tensor_name_span_len] = '\0';
+            auto * tensor_name = override;
+            auto * buffer_type = &override[tensor_name_span_len + 1];
+            if (buft_list.find(buffer_type) == buft_list.end()) {
+                printf("error: unrecognized buffer type '%s'\n", buffer_type);
+                printf("Available buffer types:\n");
+                for (const auto & it : buft_list) {
+                    printf("  %s\n", ggml_backend_buft_name(it.second));
+                }
+                return false;
+            }
+            group_tensor_buft_overrides.push_back({tensor_name, buft_list.at(buffer_type)});
+            override_span_len = std::strcspn(override_group, ";");
+        }
+        group_tensor_buft_overrides.push_back({nullptr,nullptr});
+        out.push_back(group_tensor_buft_overrides);
+        override_group_span_len = std::strcspn(value, ",");
+    } while (!last_group);
+
+    return true;
 }
 
 static void register_rpc_server_list(const std::string & servers) {
@@ -528,13 +586,18 @@ static ggml_type ggml_type_from_name(const std::string & s) {
 }
 
 static cmd_params parse_cmd_params(int argc, char ** argv) {
-    numa_prescan(argc, argv);
-
     cmd_params        params;
     std::string       arg;
     bool              invalid_param = false;
     const std::string arg_prefix    = "--";
     const char        split_delim   = ',';
+
+    // -dev, -ot and --list-devices resolve against the device registry, which under --numa split
+    // is complete only after initialization; the raw values are collected here and resolved after
+    // the loop, so the arguments work in any order (see the same flow in common/arg.cpp)
+    std::vector<std::string> device_args;
+    std::vector<std::string> ot_args;
+    bool                     list_devices = false;
 
     params.verbose              = cmd_params_defaults.verbose;
     params.output_format        = cmd_params_defaults.output_format;
@@ -681,22 +744,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto combos = string_split<std::string>(argv[i], split_delim);
-                for (const auto & combo : combos) {
-                    try {
-                        params.devices.push_back(parse_devices_arg(combo));
-                    } catch (const std::exception & e) {
-                        fprintf(stderr, "error: %s\n", e.what());
-                        invalid_param = true;
-                        break;
-                    }
-                }
-                if (invalid_param) {
-                    break;
-                }
+                device_args.push_back(argv[i]);
             } else if (arg == "--list-devices") {
-                common_print_available_devices();
-                exit(0);
+                list_devices = true;
             } else if (arg == "-t" || arg == "--threads") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -952,83 +1002,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto * value = argv[i];
-                /* static */ std::map<std::string, ggml_backend_buffer_type_t> buft_list;
-                if (buft_list.empty()) {
-                    // enumerate all the devices and add their buffer types to the list
-                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                        auto * dev = ggml_backend_dev_get(i);
-                        auto * buft = ggml_backend_dev_buffer_type(dev);
-                        if (buft) {
-                            buft_list[ggml_backend_buft_name(buft)] = buft;
-                        }
-                    }
-                }
-                auto override_group_span_len = std::strcspn(value, ",");
-                bool last_group = false;
-                do {
-                    if (override_group_span_len == 0) {
-                        // Adds an empty override-tensors for an empty span
-                        params.tensor_buft_overrides.push_back({{}});
-                        if (value[override_group_span_len] == '\0') {
-                            value = &value[override_group_span_len];
-                            last_group = true;
-                        } else {
-                            value = &value[override_group_span_len + 1];
-                            override_group_span_len = std::strcspn(value, ",");
-                        }
-                        continue;
-                    }
-                    // Stamps null terminators into the argv
-                    // value for this option to avoid the
-                    // memory leak present in the implementation
-                    // over in arg.cpp. Acceptable because we
-                    // only parse these args once in this program.
-                    auto * override_group = value;
-                    if (value[override_group_span_len] == '\0') {
-                        value = &value[override_group_span_len];
-                        last_group = true;
-                    } else {
-                        value[override_group_span_len] = '\0';
-                        value = &value[override_group_span_len + 1];
-                    }
-                    std::vector<llama_model_tensor_buft_override> group_tensor_buft_overrides{};
-                    auto override_span_len = std::strcspn(override_group, ";");
-                    while (override_span_len > 0) {
-                        auto * override = override_group;
-                        if (override_group[override_span_len] != '\0') {
-                            override_group[override_span_len] = '\0';
-                            override_group = &override_group[override_span_len + 1];
-                        } else {
-                            override_group = &override_group[override_span_len];
-                        }
-                        auto tensor_name_span_len = std::strcspn(override, "=");
-                        if (tensor_name_span_len >= override_span_len) {
-                            invalid_param = true;
-                            break;
-                        }
-                        override[tensor_name_span_len] = '\0';
-                        auto * tensor_name = override;
-                        auto * buffer_type = &override[tensor_name_span_len + 1];
-                        if (buft_list.find(buffer_type) == buft_list.end()) {
-                            printf("error: unrecognized buffer type '%s'\n", buffer_type);
-                            printf("Available buffer types:\n");
-                            for (const auto & it : buft_list) {
-                                printf("  %s\n", ggml_backend_buft_name(it.second));
-                            }
-                            invalid_param = true;
-                            break;
-                        }
-                        group_tensor_buft_overrides.push_back({tensor_name, buft_list.at(buffer_type)});
-                        override_span_len = std::strcspn(override_group, ";");
-                    }
-                    if (invalid_param) {
-                        break;
-                    }
-                    group_tensor_buft_overrides.push_back({nullptr,nullptr});
-                    params.tensor_buft_overrides.push_back(group_tensor_buft_overrides);
-                    override_group_span_len = std::strcspn(value, ",");
-                } while (!last_group);
+                ot_args.push_back(argv[i]);
             } else if (arg == "-r" || arg == "--repetitions") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1098,6 +1072,36 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
         print_usage(argc, argv);
         exit(1);
+    }
+
+    // resolve the collected device and override arguments, see the comment at the top of the loop
+    if (params.numa == GGML_NUMA_STRATEGY_SPLIT) {
+        // the CPU backend is a shared library in some builds, it has to be loaded before it can be asked
+        ggml_backend_load_all();
+        if (llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+            fprintf(stderr, "error: --numa split could not be initialized\n");
+            exit(1);
+        }
+    }
+    for (const auto & value : device_args) {
+        for (const auto & combo : string_split<std::string>(value, split_delim)) {
+            try {
+                params.devices.push_back(parse_devices_arg(combo));
+            } catch (const std::exception & e) {
+                fprintf(stderr, "error: %s\n", e.what());
+                exit(1);
+            }
+        }
+    }
+    for (const auto & value : ot_args) {
+        if (!parse_ot_arg(value, params.tensor_buft_overrides)) {
+            fprintf(stderr, "error: invalid parameter for argument: -ot\n");
+            exit(1);
+        }
+    }
+    if (list_devices) {
+        common_print_available_devices();
+        exit(0);
     }
 
     if (!params.hf_repo.empty()) {
