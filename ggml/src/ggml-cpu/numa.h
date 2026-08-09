@@ -42,4 +42,7 @@ void   free_onnode (void * ptr, size_t size);
 // node the page at addr is on, -1 if that cannot be determined
 int page_node(const void * addr);
 
+// pin the calling thread to the given CPUs, best effort
+bool bind_current_thread(const std::vector<int> & cpus);
+
 } // namespace ggml::cpu::numa

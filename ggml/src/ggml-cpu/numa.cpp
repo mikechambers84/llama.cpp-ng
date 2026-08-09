@@ -324,6 +324,22 @@ void free_onnode(void * ptr, size_t size) {
     }
 }
 
+bool bind_current_thread(const std::vector<int> & cpus) {
+    if (cpus.empty()) {
+        return false;
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int cpu : cpus) {
+        if (cpu >= 0 && cpu < CPU_SETSIZE) {
+            CPU_SET(cpu, &set);
+        }
+    }
+
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
+}
+
 static std::vector<int> process_cpu_mask() {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -369,6 +385,12 @@ void * alloc_onnode(size_t size, int node, std::string & error) {
 void free_onnode(void * ptr, size_t size) {
     (void) ptr;
     (void) size;
+}
+
+bool bind_current_thread(const std::vector<int> & cpus) {
+    return false;
+
+    (void) cpus;
 }
 
 #endif

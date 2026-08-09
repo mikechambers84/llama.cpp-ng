@@ -9,8 +9,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -95,12 +99,112 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 
 static int ggml_backend_cpu_device_get_n_threads_max(ggml_backend_dev_t dev);
 
+// a NUMA node backend computes on its own dispatcher thread. the dispatcher is pinned to the node, so the
+// OpenMP team and the thread pool it drives stay on the node instead of following the scheduler thread
+// across sockets, and graph_compute becomes asynchronous, which lets several node backends overlap
+struct ggml_backend_cpu_async {
+    std::thread             thread;
+    std::mutex              mutex;
+    std::condition_variable cv;
+
+    struct ggml_cgraph *    graph  = NULL; // pending work, a private copy owned by this backend
+    enum ggml_status        status = GGML_STATUS_SUCCESS; // of the last completed graph
+    bool                    stop   = false;
+
+    // graph_compute_async must consume the graph before it returns: the caller reuses the memory that
+    // holds the graph and its tensor metadata for the next graph while this one still runs. the tensor
+    // structs are therefore cloned here at hand-off. only the metadata is copied, the data pointers stay,
+    // writes to them are ordered by the synchronization the scheduler already does between backends
+    std::deque<struct ggml_tensor>                                        tensors;
+    std::vector<struct ggml_tensor *>                                     nodes;
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *>  map;
+    std::vector<int32_t>                                                  use_counts;
+    struct ggml_hash_set                                                  hash       = {};
+    struct ggml_cgraph                                                    graph_copy = {};
+
+    ~ggml_backend_cpu_async() {
+        if (hash.size > 0) {
+            ggml_hash_set_free(&hash);
+        }
+    }
+
+    // a struct copy that keeps pointer identity between clones through the map, but does not follow the
+    // tensor's own src pointers. that is enough for everything outside the node list: those are leafs,
+    // weights and the outputs of earlier graphs, whose fields are read but whose links are not. following
+    // the links would walk back through everything computed so far on every hand-off
+    struct ggml_tensor * clone(const struct ggml_tensor * t) {
+        if (t == NULL) {
+            return NULL;
+        }
+        const auto it = map.find(t);
+        if (it != map.end()) {
+            return it->second;
+        }
+        tensors.push_back(*t);
+        struct ggml_tensor * c = &tensors.back();
+        map.emplace(t, c);
+        return c;
+    }
+
+    // returns a self-owned copy of cgraph that stays valid while it is being computed
+    struct ggml_cgraph * take(struct ggml_cgraph * cgraph) {
+        tensors.clear();
+        nodes.clear();
+        map.clear();
+
+        nodes.reserve(cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            // in evaluation order, so a tensor cloned as a src here gets its links set when its own turn comes
+            struct ggml_tensor * c = clone(cgraph->nodes[i]);
+            c->view_src = clone(c->view_src);
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                c->src[j] = clone(c->src[j]);
+            }
+            nodes.push_back(c);
+        }
+
+        // op fusion looks tensors up in the graph's hash set to check their use counts, so the copy
+        // needs one over the clones. the counts come from the source graph: recounting inside this
+        // graph alone would allow fusing over tensors that a later part of the split graph still reads
+        if (hash.size > 0) {
+            ggml_hash_set_free(&hash);
+        }
+        hash = ggml_hash_set_new(2*map.size() + 1);
+        use_counts.assign(hash.size, 0);
+
+        const bool src_counts = cgraph->visited_hash_set.size > 0 && cgraph->use_counts != NULL;
+        for (const auto & [orig, copy] : map) {
+            const size_t pos = ggml_hash_insert(&hash, copy);
+            if (src_counts) {
+                const size_t src_pos = ggml_hash_find(&cgraph->visited_hash_set, orig);
+                if (ggml_bitset_get(cgraph->visited_hash_set.used, src_pos)) {
+                    use_counts[pos] = cgraph->use_counts[src_pos];
+                }
+            }
+        }
+
+        graph_copy                  = {};
+        graph_copy.size             = cgraph->n_nodes;
+        graph_copy.n_nodes          = cgraph->n_nodes;
+        graph_copy.nodes            = nodes.data();
+        graph_copy.use_counts       = use_counts.data();
+        graph_copy.visited_hash_set = hash;
+        graph_copy.order            = cgraph->order;
+        graph_copy.uid              = cgraph->uid;
+
+        return &graph_copy;
+    }
+};
+
 struct ggml_backend_cpu_context {
     int                 n_threads;
     ggml_threadpool_t   threadpool;
 
     // owned by a NUMA node backend, it is pinned to the CPUs of that node
     ggml_threadpool_t   own_threadpool;
+
+    // owned by a NUMA node backend, NULL means graph_compute runs synchronously on the calling thread
+    struct ggml_backend_cpu_async * async;
 
     uint8_t *           work_data;
     size_t              work_size;
@@ -123,6 +227,15 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    if (cpu_ctx->async != NULL) {
+        {
+            std::lock_guard<std::mutex> lock(cpu_ctx->async->mutex);
+            cpu_ctx->async->stop = true;
+            cpu_ctx->async->cv.notify_all();
+        }
+        cpu_ctx->async->thread.join(); // waits for an in-flight graph
+        delete cpu_ctx->async;
+    }
     if (cpu_ctx->own_threadpool != NULL) {
         ggml_threadpool_free(cpu_ctx->own_threadpool);
     }
@@ -176,9 +289,7 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
-static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
-
+static enum ggml_status ggml_backend_cpu_graph_compute_impl(struct ggml_backend_cpu_context * cpu_ctx, struct ggml_cgraph * cgraph) {
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, ggml_backend_cpu_threadpool(cpu_ctx));
 
     if (cpu_ctx->work_size < cplan.work_size) {
@@ -199,6 +310,77 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     return ggml_graph_compute(cgraph, &cplan);
 }
 
+static void ggml_backend_cpu_async_loop(struct ggml_backend_cpu_context * cpu_ctx, std::vector<int> cpus) {
+    // before anything runs here, so that the threads serving this backend inherit the node
+    ggml::cpu::numa::bind_current_thread(cpus);
+
+    struct ggml_backend_cpu_async * a = cpu_ctx->async;
+    for (;;) {
+        struct ggml_cgraph * graph;
+        {
+            std::unique_lock<std::mutex> lock(a->mutex);
+            a->cv.wait(lock, [a] { return a->graph != NULL || a->stop; });
+            if (a->stop) {
+                return;
+            }
+            graph = a->graph;
+        }
+
+        const enum ggml_status status = ggml_backend_cpu_graph_compute_impl(cpu_ctx, graph);
+
+        {
+            std::lock_guard<std::mutex> lock(a->mutex);
+            if (status != GGML_STATUS_SUCCESS) {
+                GGML_LOG_ERROR("%s: graph computation failed with status %d\n", __func__, status);
+            }
+            if (a->status == GGML_STATUS_SUCCESS) {
+                a->status = status; // kept until a caller sees it
+            }
+            a->graph = NULL;
+            a->cv.notify_all();
+        }
+    }
+}
+
+static void ggml_backend_cpu_async_wait_idle(struct ggml_backend_cpu_context * cpu_ctx) {
+    struct ggml_backend_cpu_async * a = cpu_ctx->async;
+    if (a == NULL) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(a->mutex);
+    a->cv.wait(lock, [a] { return a->graph == NULL; });
+}
+
+static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+    struct ggml_backend_cpu_async * a = cpu_ctx->async;
+    if (a == NULL) {
+        return ggml_backend_cpu_graph_compute_impl(cpu_ctx, cgraph);
+    }
+
+    std::unique_lock<std::mutex> lock(a->mutex);
+    a->cv.wait(lock, [a] { return a->graph == NULL; });
+
+    // as with other asynchronous backends, a failure surfaces on the next call
+    if (a->status != GGML_STATUS_SUCCESS) {
+        const enum ggml_status status = a->status;
+        a->status = GGML_STATUS_SUCCESS;
+        return status;
+    }
+
+    a->graph = a->take(cgraph);
+    a->cv.notify_all();
+
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_cpu_synchronize(ggml_backend_t backend) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+    ggml_backend_cpu_async_wait_idle(cpu_ctx);
+}
+
 static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .get_name                = */ ggml_backend_cpu_get_name,
     /* .free                    = */ ggml_backend_cpu_free,
@@ -207,7 +389,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
-    /* .synchronize             = */ NULL,
+    /* .synchronize             = */ ggml_backend_cpu_synchronize,
     /* .graph_plan_create       = */ ggml_backend_cpu_graph_plan_create,
     /* .graph_plan_free         = */ ggml_backend_cpu_graph_plan_free,
     /* .graph_plan_update       = */ NULL,
@@ -235,6 +417,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->threadpool          = NULL;
     ctx->own_threadpool      = NULL;
+    ctx->async               = NULL;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
@@ -265,6 +448,8 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
 
+    ggml_backend_cpu_async_wait_idle(ctx);
+
     // a node backend cannot use more threads than its node has CPUs
     const int n_threads_max = ggml_backend_cpu_device_get_n_threads_max(backend_cpu->device);
     if (n_threads_max > 0) {
@@ -279,6 +464,8 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
 
+    ggml_backend_cpu_async_wait_idle(ctx);
+
     if (ctx->threadpool && ctx->threadpool != threadpool) {
         // already had a different threadpool, pause/suspend it before switching
         ggml_threadpool_pause(ctx->threadpool);
@@ -290,6 +477,8 @@ void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+
+    ggml_backend_cpu_async_wait_idle(ctx);
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = abort_callback_data;
 }
@@ -528,7 +717,8 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->device_id   = ctx->numa_node < 0 ? nullptr : ctx->device_id.c_str();
     ggml_backend_cpu_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
-        /* .async                 = */ false,
+        // a node device computes on its own dispatcher thread
+        /* .async                 = */ ctx->numa_node >= 0,
         /* .host_buffer           = */ false,
         // a node device must not map file pages, its buffers have to be bound to the node
         /* .buffer_from_host_ptr  = */ ctx->numa_node < 0,
@@ -579,6 +769,17 @@ static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t de
 
         // one thread per physical core until a thread count is set
         ctx->n_threads = dev_ctx->n_cores;
+
+        ctx->async = new ggml_backend_cpu_async;
+        try {
+            ctx->async->thread = std::thread(ggml_backend_cpu_async_loop, ctx, dev_ctx->cpus);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: failed to start the dispatcher thread of %s: %s\n", __func__, dev_ctx->name.c_str(), e.what());
+            delete ctx->async;
+            ctx->async = NULL;
+            ggml_backend_free(backend);
+            return NULL;
+        }
     }
 
     return backend;
