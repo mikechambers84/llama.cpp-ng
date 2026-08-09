@@ -942,11 +942,18 @@ static ggml_backend_dev_t ggml_backend_cpu_reg_get_device(ggml_backend_reg_t reg
 // Return values match enum llama_numa_init_status: 0 success, 1 unavailable, 2 failed.
 // Nothing is registered unless every node passes, so a failure leaves the registry untouched and a caller
 // that recovers from it never sees a half built configuration.
-static int ggml_backend_cpu_numa_split_init(void) {
+// The devices are handed back through devices/n_devices for the caller to register: a backend
+// cannot depend on the registry, which lives above ggml-base. On entry *n_devices is the capacity
+// of devices; on return it is the number of devices handed out, which is 0 on every call after
+// the first so that they cannot be registered twice.
+static int ggml_backend_cpu_numa_split_init(ggml_backend_dev_t * devices, size_t * n_devices) {
     static std::mutex mutex;
     static int        status = -1;
 
     std::lock_guard<std::mutex> lock(mutex);
+
+    const size_t capacity = *n_devices;
+    *n_devices = 0;
 
     if (status >= 0) {
         GGML_LOG_INFO("%s: NUMA already initialized\n", __func__);
@@ -959,6 +966,13 @@ static int ggml_backend_cpu_numa_split_init(void) {
         GGML_LOG_WARN("%s: --numa split needs 2 or more usable NUMA nodes (found %zu), continuing without NUMA optimizations\n",
                 __func__, nodes.size());
         status = 1;
+        return status;
+    }
+
+    if (nodes.size() > capacity) {
+        GGML_LOG_ERROR("%s: %zu NUMA nodes exceed the supported maximum of %zu devices\n",
+                __func__, nodes.size(), capacity);
+        status = 2;
         return status;
     }
 
@@ -1001,22 +1015,23 @@ static int ggml_backend_cpu_numa_split_init(void) {
         devs.push_back(std::move(dev));
     }
 
-    // phase 2: commit
-    static std::vector<std::unique_ptr<ggml_backend_cpu_device_context>> ctxs_registered;
-    static std::vector<std::unique_ptr<ggml_backend_device>>             devs_registered;
+    // phase 2: commit, the caller registers the devices
+    static std::vector<std::unique_ptr<ggml_backend_cpu_device_context>> ctxs_created;
+    static std::vector<std::unique_ptr<ggml_backend_device>>             devs_created;
 
     std::string names;
     for (size_t i = 0; i < devs.size(); i++) {
-        ggml_backend_device_register(devs[i].get());
+        devices[i] = devs[i].get();
 
         names += names.empty() ? "" : ", ";
         names += ctxs[i]->name;
 
-        ctxs_registered.push_back(std::move(ctxs[i]));
-        devs_registered.push_back(std::move(devs[i]));
+        ctxs_created.push_back(std::move(ctxs[i]));
+        devs_created.push_back(std::move(devs[i]));
     }
+    *n_devices = devs_created.size();
 
-    GGML_LOG_INFO("%s: registered devices: %s\n", __func__, names.c_str());
+    GGML_LOG_INFO("%s: devices: %s\n", __func__, names.c_str());
 
     status = 0;
     return status;
