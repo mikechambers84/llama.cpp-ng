@@ -297,6 +297,9 @@ struct ggml_backend_cpu_device_context {
     std::vector<int> cpus;
     int              n_cores = 0;
 
+    // the node local buffer type of this device, its name is the device name so that it stays unique
+    ggml_backend_buffer_type buft = {};
+
     ggml_backend_cpu_device_context() {
 #ifdef __APPLE__
         size_t len = 0;
@@ -357,6 +360,70 @@ struct ggml_backend_cpu_device_context {
 #endif
     }
 };
+
+// CPU backend - NUMA node local buffer type
+
+static const char * ggml_backend_cpu_numa_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)buft->device->context;
+
+    return ctx->name.c_str();
+}
+
+static void ggml_backend_cpu_numa_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml::cpu::numa::free_onnode(buffer->context, buffer->size);
+}
+
+static ggml_backend_buffer_t ggml_backend_cpu_numa_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)buft->device->context;
+
+    std::string error;
+
+    void * data = ggml::cpu::numa::alloc_onnode(size, ctx->numa_node, error);
+    if (data == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate %zu MiB on %s: %s\n", __func__, size >> 20, ctx->name.c_str(), error.c_str());
+        return NULL;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, size);
+    if (buffer == NULL) {
+        ggml::cpu::numa::free_onnode(data, size);
+        return NULL;
+    }
+
+    buffer->buft              = buft;
+    buffer->iface.free_buffer = ggml_backend_cpu_numa_buffer_free_buffer;
+
+    return buffer;
+}
+
+static size_t ggml_backend_cpu_numa_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return TENSOR_ALIGNMENT;
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_cpu_numa_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return true;
+
+    GGML_UNUSED(buft);
+}
+
+static void ggml_backend_cpu_numa_buffer_type_init(ggml_backend_cpu_device_context * ctx, ggml_backend_dev_t dev) {
+    ctx->buft = {
+        /* .iface   = */ {
+            /* .get_name         = */ ggml_backend_cpu_numa_buffer_type_get_name,
+            /* .alloc_buffer     = */ ggml_backend_cpu_numa_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_numa_buffer_type_get_alignment,
+            /* .get_max_size     = */ NULL,
+            /* .get_alloc_size   = */ NULL,
+            /* .is_host          = */ ggml_backend_cpu_numa_buffer_type_is_host,
+        },
+        /* .device  = */ dev,
+        /* .context = */ NULL,
+    };
+}
+
+// CPU backend - device interface
 
 static const char * ggml_backend_cpu_device_get_name(ggml_backend_dev_t dev) {
     struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
@@ -437,9 +504,13 @@ static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t de
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cpu_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type();
+    struct ggml_backend_cpu_device_context * ctx = (struct ggml_backend_cpu_device_context *)dev->context;
 
-    GGML_UNUSED(dev);
+    if (ctx->numa_node >= 0) {
+        return &ctx->buft;
+    }
+
+    return ggml_backend_cpu_buffer_type();
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {

@@ -135,6 +135,38 @@ int main() {
         check(nodes.size() == 16, "sixteen nodes");
     }
 
+    printf("node local allocation\n");
+    if (topology().size() < 2) {
+        printf("  skipped, this machine has fewer than 2 usable NUMA nodes\n");
+    } else {
+        const size_t size = 64ull << 20;
+
+        for (const auto & n : topology()) {
+            std::string error;
+
+            void * data = alloc_onnode(size, n.id, error);
+            check(data != nullptr, "allocated 64 MiB on node " + std::to_string(n.id) + (data ? "" : ": " + error));
+            if (data == nullptr) {
+                continue;
+            }
+
+            // the allocator only samples pages, so check the whole range here
+            size_t n_remote = 0;
+            for (size_t off = 0; off < size; off += 2u << 20) {
+                ((char *) data)[off] = 1;
+                if (page_node((char *) data + off) != n.id) {
+                    n_remote++;
+                }
+            }
+            check(n_remote == 0, "every page of node " + std::to_string(n.id) + " is local");
+
+            free_onnode(data, size);
+        }
+
+        std::string error;
+        check(alloc_onnode(size, 999, error) == nullptr && !error.empty(), "allocation on an unusable node fails");
+    }
+
     // without --numa split the CPU backend must look exactly like it always did
     printf("cpu device defaults\n");
     {
