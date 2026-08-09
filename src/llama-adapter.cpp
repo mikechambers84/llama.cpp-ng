@@ -4,6 +4,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <map>
 #include <cassert>
 #include <sstream>
@@ -293,28 +294,39 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         }
     }
 
-    // get extra buffer types of the CPU
+    // get the extra buffer types of every device, e.g. the repack buffer types of the CPU and,
+    // under --numa split, of every NUMA node device
     // TODO: a more general solution for non-CPU extra buft should be implemented in the future
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12593#pullrequestreview-2718659948
     std::vector<ggml_backend_buffer_type_t> buft_extra;
-    {
-        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (!cpu_dev) {
-            throw std::runtime_error(format("%s: no CPU backend found", __func__));
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg) {
+            continue;
         }
-        auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
 
         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
-            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
 
         if (ggml_backend_dev_get_extra_bufts_fn) {
-            ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(cpu_dev);
+            ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
             while (extra_bufts && *extra_bufts) {
                 buft_extra.emplace_back(*extra_bufts);
                 ++extra_bufts;
             }
         }
     }
+
+    // an extra buffer type of a device this model does not enumerate, e.g. the meta extra buffer
+    // type wrapping the per node repack buffer types of a tensor split
+    auto is_extra_buft = [&](ggml_backend_buffer_type_t buft) {
+        auto * dev = ggml_backend_buft_get_device(buft);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META && buft != ggml_backend_dev_buffer_type(dev)) {
+            return true;
+        }
+        return std::find(buft_extra.begin(), buft_extra.end(), buft) != buft_extra.end();
+    };
 
     // add tensors
     for (auto & it : ab_map) {
@@ -335,18 +347,14 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
 
         // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
-        for (auto & ex : buft_extra) {
-            if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+        if (is_extra_buft(buft)) {
+            LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
 
-                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                if (!cpu_dev) {
-                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
-                }
-                buft = ggml_backend_dev_buffer_type(cpu_dev);
-
-                break;
+            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu_dev) {
+                throw std::runtime_error(format("%s: no CPU backend found", __func__));
             }
+            buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
         LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
