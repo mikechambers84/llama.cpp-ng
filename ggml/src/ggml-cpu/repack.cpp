@@ -4742,7 +4742,15 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
+    if (tensor_traits == nullptr) {
+        // this tensor did not qualify for repacking (see init_tensor), e.g. a tensor-split shard
+        // whose row count does not divide evenly. it is stored as plain data; the compute path
+        // makes the same decision from the tensor's type and shape and uses the normal kernels
+        GGML_LOG_WARN("%s: tensor %s was not repacked\n", __func__, tensor->name);
+        memcpy(tensor->data, data, size);
+        return;
+    }
+    auto OK = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);

@@ -1006,8 +1006,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     };
 
     // for CPU devices (a NUMA node under --numa split) the extra buffer types, i.e. repack, must come first,
-    // as in make_cpu_buft_list, otherwise the plain node buffer type wins and repacking never happens
-    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+    // as in make_cpu_buft_list, otherwise the plain node buffer type wins and repacking never happens.
+    // the same goes for a Meta device: over CPU devices it exposes their repack buffer types as meta
+    // extra buffer types (GPU-backed meta devices expose none, so the order does not matter there)
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
         add_extra_bufts();
         add_default_buft();
     } else {
