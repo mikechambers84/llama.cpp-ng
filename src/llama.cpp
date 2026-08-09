@@ -204,17 +204,27 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         std::vector<llama_device> gpus;
         std::vector<llama_device> igpus;
         std::vector<llama_device> rpc_servers;
+        std::vector<llama_device> numa_cpus; // --numa split node devices
 
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            std::vector<ggml_backend_dev_t> devs;
-            devs.reserve(ggml_backend_dev_count());
+            std::vector<ggml_backend_dev_t> accel_devs;
+            std::vector<ggml_backend_dev_t> numa_devs;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+                if (llama_dev_numa_node(dev) >= 0) {
+                    // a --numa split node device, used only if there is no accelerator
+                    numa_devs.push_back(dev);
+                } else if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
                     LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-                    continue;
+                } else {
+                    accel_devs.push_back(dev);
                 }
-                devs.push_back(dev);
+            }
+            // prefer accelerators, fall back to the NUMA node devices
+            std::vector<ggml_backend_dev_t> & devs = accel_devs.empty() ? numa_devs : accel_devs;
+            if (!accel_devs.empty() && !numa_devs.empty()) {
+                LLAMA_LOG_INFO("%s: %zu NUMA CPU device(s) available for -dev but not auto-used for tensor parallelism because accelerators are present\n",
+                        __func__, numa_devs.size());
             }
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
@@ -238,6 +248,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 switch (ggml_backend_dev_type(dev)) {
                     case GGML_BACKEND_DEVICE_TYPE_CPU:
+                        // a --numa split node device is a real placement target, the plain CPU is handled separately
+                        if (llama_dev_numa_node(dev) >= 0) {
+                            numa_cpus.push_back({false, dev});
+                        }
+                        break;
                     case GGML_BACKEND_DEVICE_TYPE_ACCEL:
                         // skip CPU backends since they are handled separately
                         break;
@@ -293,6 +308,17 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
         if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
+        }
+
+        // use the --numa split node devices to distribute layers only if there is no accelerator.
+        // with an accelerator present they stay available for explicit -dev / -ot placement.
+        if (!numa_cpus.empty()) {
+            if (model->devices.empty()) {
+                model->devices.insert(model->devices.end(), numa_cpus.begin(), numa_cpus.end());
+            } else {
+                LLAMA_LOG_INFO("%s: %zu NUMA CPU device(s) available for -dev/-ot but not auto-used because accelerators are present\n",
+                        __func__, numa_cpus.size());
+            }
         }
     }
 
