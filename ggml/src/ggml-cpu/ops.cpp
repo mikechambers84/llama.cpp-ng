@@ -2785,9 +2785,6 @@ static void ggml_compute_forward_reglu_f32(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -2796,14 +2793,10 @@ static void ggml_compute_forward_reglu_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
 
@@ -2812,10 +2805,10 @@ static void ggml_compute_forward_reglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_reglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_reglu_f32(tile.ic1 - tile.ic0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -2844,9 +2837,6 @@ static void ggml_compute_forward_reglu_f16(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -2855,14 +2845,10 @@ static void ggml_compute_forward_reglu_f16(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
         ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
 
@@ -2871,10 +2857,10 @@ static void ggml_compute_forward_reglu_f16(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_reglu_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_reglu_f16(tile.ic1 - tile.ic0, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             const float v = GGML_FP16_TO_FP32(x);
             GGML_UNUSED(v);
@@ -2928,9 +2914,6 @@ static void ggml_compute_forward_geglu_f32(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -2939,14 +2922,10 @@ static void ggml_compute_forward_geglu_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
 
@@ -2955,10 +2934,10 @@ static void ggml_compute_forward_geglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_geglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_geglu_f32(tile.ic1 - tile.ic0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -2987,9 +2966,6 @@ static void ggml_compute_forward_geglu_f16(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -2998,14 +2974,10 @@ static void ggml_compute_forward_geglu_f16(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
         ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
 
@@ -3014,10 +2986,10 @@ static void ggml_compute_forward_geglu_f16(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_geglu_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_geglu_f16(tile.ic1 - tile.ic0, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             const float v = GGML_FP16_TO_FP32(x);
             GGML_UNUSED(v);
@@ -3071,9 +3043,6 @@ static void ggml_compute_forward_swiglu_f32(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -3082,14 +3051,10 @@ static void ggml_compute_forward_swiglu_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
 
@@ -3098,10 +3063,10 @@ static void ggml_compute_forward_swiglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_swiglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_swiglu_f32(tile.ic1 - tile.ic0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -3130,9 +3095,6 @@ static void ggml_compute_forward_swiglu_f16(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -3141,14 +3103,10 @@ static void ggml_compute_forward_swiglu_f16(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
         ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
 
@@ -3157,10 +3115,10 @@ static void ggml_compute_forward_swiglu_f16(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_swiglu_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_swiglu_f16(tile.ic1 - tile.ic0, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             const float v = GGML_FP16_TO_FP32(x);
             GGML_UNUSED(v);
@@ -3214,9 +3172,6 @@ static void ggml_compute_forward_swiglu_oai_f32(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -3227,14 +3182,10 @@ static void ggml_compute_forward_swiglu_oai_f32(
     const float alpha = ggml_get_op_params_f32(dst, 2);
     const float limit = ggml_get_op_params_f32(dst, 3);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
         float * dst_p  = (float *) ((char *) dst->data + i1*(dst->nb[1]));
@@ -3244,7 +3195,7 @@ static void ggml_compute_forward_swiglu_oai_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const float x = std::min(src0_p[k], limit);
             const float y = std::clamp(src1_p[k], -limit, limit);
             const float out_glu = x / (1.f + expf(alpha * (-x)));
@@ -3252,7 +3203,7 @@ static void ggml_compute_forward_swiglu_oai_f32(
         }
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const float x = dst_p[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -3301,9 +3252,6 @@ static void ggml_compute_forward_geglu_erf_f32(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -3312,14 +3260,10 @@ static void ggml_compute_forward_geglu_erf_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
 
@@ -3328,10 +3272,10 @@ static void ggml_compute_forward_geglu_erf_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_geglu_erf_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_geglu_erf_f32(tile.ic1 - tile.ic0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -3360,9 +3304,6 @@ static void ggml_compute_forward_geglu_erf_f16(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -3371,14 +3312,10 @@ static void ggml_compute_forward_geglu_erf_f16(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
         ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
 
@@ -3387,10 +3324,10 @@ static void ggml_compute_forward_geglu_erf_f16(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_geglu_erf_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_geglu_erf_f16(tile.ic1 - tile.ic0, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             const float v = GGML_FP16_TO_FP32(x);
             GGML_UNUSED(v);
@@ -3444,9 +3381,6 @@ static void ggml_compute_forward_geglu_quick_f32(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -3455,14 +3389,10 @@ static void ggml_compute_forward_geglu_quick_f32(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
 
@@ -3471,10 +3401,10 @@ static void ggml_compute_forward_geglu_quick_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_geglu_quick_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_geglu_quick_f32(tile.ic1 - tile.ic0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -3503,9 +3433,6 @@ static void ggml_compute_forward_geglu_quick_f16(
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int nr = ggml_nrows(src0);
 
@@ -3514,14 +3441,10 @@ static void ggml_compute_forward_geglu_quick_f16(
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int i1 = ir0; i1 < ir1; i1++) {
+    for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
         ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
         ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
 
@@ -3530,10 +3453,10 @@ static void ggml_compute_forward_geglu_quick_f16(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_geglu_quick_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_geglu_quick_f16(tile.ic1 - tile.ic0, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])) + tile.ic0, src0_p + tile.ic0, src1_p + tile.ic0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = tile.ic0; k < tile.ic1; k++) {
             const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             const float v = GGML_FP16_TO_FP32(x);
             GGML_UNUSED(v);
@@ -4454,37 +4377,33 @@ static void ggml_compute_forward_scale_f32(
     memcpy(&s, (float *) dst->op_params + 0, sizeof(float));
     memcpy(&b, (float *) dst->op_params + 1, sizeof(float));
 
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const int nc = src0->ne[0];
     const int nr = ggml_nrows(src0);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    const int64_t tc = tile.ic1 - tile.ic0;
 
     const size_t nb01 = src0->nb[1];
 
     const size_t nb1 = dst->nb[1];
 
     if (b == 0.0f) {
-        for (int i1 = ir0; i1 < ir1; i1++) {
+        for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
             if (dst->data != src0->data) {
                 // src0 is same shape as dst => same indices
                 // TODO: add x parameter to ggml_vec_scale_f32 and remove this memcpy
-                memcpy((char *)dst->data + i1*nb1, (char *)src0->data + i1*nb01, nc * sizeof(float));
+                memcpy((char *)dst->data + i1*nb1 + tile.ic0*sizeof(float),
+                       (char *)src0->data + i1*nb01 + tile.ic0*sizeof(float), tc * sizeof(float));
             }
-            ggml_vec_scale_f32(nc, (float *) ((char *) dst->data + i1*nb1), s);
+            ggml_vec_scale_f32(tc, (float *) ((char *) dst->data + i1*nb1) + tile.ic0, s);
         }
     } else {
-        for (int i1 = ir0; i1 < ir1; i1++) {
-            ggml_vec_mad1_f32(nc,
-                (float *) ((char *) dst->data  + i1*nb1),
-                (float *) ((char *) src0->data + i1*nb1),
+        for (int64_t i1 = tile.ir0; i1 < tile.ir1; i1++) {
+            ggml_vec_mad1_f32(tc,
+                (float *) ((char *) dst->data  + i1*nb1) + tile.ic0,
+                (float *) ((char *) src0->data + i1*nb1) + tile.ic0,
                 s, b);
         }
     }
@@ -4781,17 +4700,10 @@ static void ggml_compute_forward_get_rows_f16(
     assert(nb00 == sizeof(ggml_fp16_t));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int64_t i = ir0; i < ir1; ++i) {
+    for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -4800,8 +4712,8 @@ static void ggml_compute_forward_get_rows_f16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_fp16_to_fp32(
-            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                       (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + tile.ic0,
+                       (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3)  + tile.ic0, tile.ic1 - tile.ic0);
     }
 }
 
@@ -4822,17 +4734,10 @@ static void ggml_compute_forward_get_rows_bf16(
     assert(nb00 == sizeof(ggml_bf16_t));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int64_t i = ir0; i < ir1; ++i) {
+    for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -4841,8 +4746,8 @@ static void ggml_compute_forward_get_rows_bf16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_bf16_to_fp32(
-            (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
+            (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + tile.ic0,
+                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3)  + tile.ic0, tile.ic1 - tile.ic0);
     }
 }
 
@@ -4863,17 +4768,10 @@ static void ggml_compute_forward_get_rows_f32(
     assert(nb00 == sizeof(float));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    // thread tile: whole rows, or column slices when the rows are few and long
+    const auto tile = get_thread_tile(params, nr, nc);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int64_t i = ir0; i < ir1; ++i) {
+    for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
@@ -4881,9 +4779,9 @@ static void ggml_compute_forward_get_rows_f32(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
-        ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+        ggml_vec_cpy_f32(tile.ic1 - tile.ic0,
+                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3)  + tile.ic0,
+                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + tile.ic0);
     }
 }
 
