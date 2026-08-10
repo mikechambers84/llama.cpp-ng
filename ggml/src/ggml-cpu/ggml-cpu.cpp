@@ -496,13 +496,19 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
 
-    ggml_backend_cpu_async_wait_idle(ctx);
-
     // a node backend cannot use more threads than its node has CPUs
     const int n_threads_max = ggml_backend_cpu_device_get_n_threads_max(backend_cpu->device);
     if (n_threads_max > 0) {
         n_threads = std::min(n_threads, n_threads_max);
     }
+
+    // callers re-apply the thread count on every graph, and waiting for the queue on every
+    // call would drain a pipelined scheduler; only an actual change has to wait
+    if (n_threads == ctx->n_threads) {
+        return;
+    }
+
+    ggml_backend_cpu_async_wait_idle(ctx);
 
     // the node pool starts at one thread per physical core; a larger explicit request (SMT
     // threads) recreates it at the requested size. it only ever grows: a pool larger than the
@@ -528,9 +534,13 @@ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
 
+    if (ctx->threadpool == threadpool) {
+        return;
+    }
+
     ggml_backend_cpu_async_wait_idle(ctx);
 
-    if (ctx->threadpool && ctx->threadpool != threadpool) {
+    if (ctx->threadpool) {
         // already had a different threadpool, pause/suspend it before switching
         ggml_threadpool_pause(ctx->threadpool);
     }
