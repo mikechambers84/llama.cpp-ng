@@ -100,34 +100,19 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
 static int ggml_backend_cpu_device_get_n_threads_max(ggml_backend_dev_t dev);
 static ggml_threadpool_t ggml_backend_cpu_device_threadpool(ggml_backend_dev_t dev, int n_threads);
 
-// a NUMA node backend computes on its own dispatcher thread. the dispatcher is pinned to the node, so the
-// OpenMP team and the thread pool it drives stay on the node instead of following the scheduler thread
-// across sockets, and graph_compute becomes asynchronous, which lets several node backends overlap.
-//
-// as with every asynchronous backend, freeing a buffer an in-flight graph still uses is the caller's
-// responsibility (synchronize first); llama pre-reserves its compute buffers, so this does not come up there
-struct ggml_backend_cpu_async {
-    std::thread             thread;
-    std::mutex              mutex;
-    std::condition_variable cv;
-
-    struct ggml_cgraph *    graph  = NULL; // pending work, a private copy owned by this backend
-    enum ggml_status        status = GGML_STATUS_SUCCESS; // of the last completed graph
-    bool                    status_logged = false; // a pending failure was already reported by synchronize
-    bool                    stop   = false;
-
-    // graph_compute_async must consume the graph before it returns: the caller reuses the memory that
-    // holds the graph and its tensor metadata for the next graph while this one still runs. the tensor
-    // structs are therefore cloned here at hand-off. only the metadata is copied, the data pointers stay,
-    // writes to them are ordered by the synchronization the scheduler already does between backends
+// graph_compute_async must consume the graph before it returns: the caller reuses the memory that
+// holds the graph and its tensor metadata for the next graph while this one still runs. the tensor
+// structs are therefore cloned here at hand-off. only the metadata is copied, the data pointers stay,
+// writes to them are ordered by the synchronization the scheduler already does between backends
+struct ggml_backend_cpu_graph_copy {
     std::deque<struct ggml_tensor>                                        tensors;
     std::vector<struct ggml_tensor *>                                     nodes;
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *>  map;
     std::vector<int32_t>                                                  use_counts;
-    struct ggml_hash_set                                                  hash       = {};
-    struct ggml_cgraph                                                    graph_copy = {};
+    struct ggml_hash_set                                                  hash  = {};
+    struct ggml_cgraph                                                    graph = {};
 
-    ~ggml_backend_cpu_async() {
+    ~ggml_backend_cpu_graph_copy() {
         if (hash.size > 0) {
             ggml_hash_set_free(&hash);
         }
@@ -151,12 +136,8 @@ struct ggml_backend_cpu_async {
         return c;
     }
 
-    // returns a self-owned copy of cgraph that stays valid while it is being computed
-    struct ggml_cgraph * take(struct ggml_cgraph * cgraph) {
-        tensors.clear();
-        nodes.clear();
-        map.clear();
-
+    // fills this with a self-owned copy of cgraph that stays valid while it is being computed
+    void take(struct ggml_cgraph * cgraph) {
         nodes.reserve(cgraph->n_nodes);
         for (int i = 0; i < cgraph->n_nodes; i++) {
             // in evaluation order, so a tensor cloned as a src here gets its links set when its own turn comes
@@ -171,9 +152,6 @@ struct ggml_backend_cpu_async {
         // op fusion looks tensors up in the graph's hash set to check their use counts, so the copy
         // needs one over the clones. the counts come from the source graph: recounting inside this
         // graph alone would allow fusing over tensors that a later part of the split graph still reads
-        if (hash.size > 0) {
-            ggml_hash_set_free(&hash);
-        }
         hash = ggml_hash_set_new(2*map.size() + 1);
         use_counts.assign(hash.size, 0);
 
@@ -188,16 +166,44 @@ struct ggml_backend_cpu_async {
             }
         }
 
-        graph_copy                  = {};
-        graph_copy.size             = cgraph->n_nodes;
-        graph_copy.n_nodes          = cgraph->n_nodes;
-        graph_copy.nodes            = nodes.data();
-        graph_copy.use_counts       = use_counts.data();
-        graph_copy.visited_hash_set = hash;
-        graph_copy.order            = cgraph->order;
-        graph_copy.uid              = cgraph->uid;
+        graph                  = {};
+        graph.size             = cgraph->n_nodes;
+        graph.n_nodes          = cgraph->n_nodes;
+        graph.nodes            = nodes.data();
+        graph.use_counts       = use_counts.data();
+        graph.visited_hash_set = hash;
+        graph.order            = cgraph->order;
+        graph.uid              = cgraph->uid;
+    }
+};
 
-        return &graph_copy;
+// one unit of asynchronous work for the dispatcher, executed in FIFO order
+struct ggml_backend_cpu_async_op {
+    enum { COMPUTE } kind = COMPUTE;
+
+    std::unique_ptr<ggml_backend_cpu_graph_copy> graph; // COMPUTE
+};
+
+// a NUMA node backend computes on its own dispatcher thread. the dispatcher is pinned to the node, so the
+// OpenMP team and the thread pool it drives stay on the node instead of following the scheduler thread
+// across sockets, and graph_compute becomes asynchronous, which lets several node backends overlap. the
+// work queue holds any number of graphs, so a pipelining scheduler can keep several in flight.
+//
+// as with every asynchronous backend, freeing a buffer an in-flight graph still uses is the caller's
+// responsibility (synchronize first); llama pre-reserves its compute buffers, so this does not come up there
+struct ggml_backend_cpu_async {
+    std::thread             thread;
+    std::mutex              mutex;
+    std::condition_variable cv;
+
+    std::deque<ggml_backend_cpu_async_op> queue;   // pending work
+    bool                    running = false;       // an op popped off the queue is being executed
+    enum ggml_status        status  = GGML_STATUS_SUCCESS; // of the last failed graph, kept until a caller sees it
+    bool                    status_logged = false; // a pending failure was already reported by synchronize
+    bool                    stop    = false;
+
+    bool idle() const {
+        return queue.empty() && !running;
     }
 };
 
@@ -239,7 +245,7 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
             cpu_ctx->async->stop = true;
             cpu_ctx->async->cv.notify_all();
         }
-        cpu_ctx->async->thread.join(); // waits for an in-flight graph
+        cpu_ctx->async->thread.join(); // drains the queued work first
         delete cpu_ctx->async;
     }
     if (cpu_ctx->own_threadpool != NULL) {
@@ -322,18 +328,25 @@ static void ggml_backend_cpu_async_loop(struct ggml_backend_cpu_context * cpu_ct
 
     struct ggml_backend_cpu_async * a = cpu_ctx->async;
     for (;;) {
-        struct ggml_cgraph * graph;
+        struct ggml_backend_cpu_async_op op;
         {
             std::unique_lock<std::mutex> lock(a->mutex);
-            a->cv.wait(lock, [a] { return a->graph != NULL || a->stop; });
-            // a graph that was handed over before the stop still runs, it must not be dropped silently
-            if (a->graph == NULL) {
+            a->cv.wait(lock, [a] { return !a->queue.empty() || a->stop; });
+            // work that was handed over before the stop still runs, it must not be dropped silently
+            if (a->queue.empty()) {
                 return;
             }
-            graph = a->graph;
+            op = std::move(a->queue.front());
+            a->queue.pop_front();
+            a->running = true;
         }
 
-        const enum ggml_status status = ggml_backend_cpu_graph_compute_impl(cpu_ctx, graph);
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+        switch (op.kind) {
+            case ggml_backend_cpu_async_op::COMPUTE:
+                status = ggml_backend_cpu_graph_compute_impl(cpu_ctx, &op.graph->graph);
+                break;
+        }
 
         {
             std::lock_guard<std::mutex> lock(a->mutex);
@@ -343,7 +356,7 @@ static void ggml_backend_cpu_async_loop(struct ggml_backend_cpu_context * cpu_ct
             if (a->status == GGML_STATUS_SUCCESS) {
                 a->status = status; // kept until a caller sees it
             }
-            a->graph = NULL;
+            a->running = false;
             a->cv.notify_all();
         }
     }
@@ -365,7 +378,7 @@ static void ggml_backend_cpu_async_wait_idle(struct ggml_backend_cpu_context * c
         return;
     }
     std::unique_lock<std::mutex> lock(a->mutex);
-    a->cv.wait(lock, [a] { return a->graph == NULL; });
+    a->cv.wait(lock, [a] { return a->idle(); });
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -376,8 +389,12 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
         return ggml_backend_cpu_graph_compute_impl(cpu_ctx, cgraph);
     }
 
-    std::unique_lock<std::mutex> lock(a->mutex);
-    a->cv.wait(lock, [a] { return a->graph == NULL; });
+    struct ggml_backend_cpu_async_op op;
+    op.kind  = ggml_backend_cpu_async_op::COMPUTE;
+    op.graph = std::make_unique<ggml_backend_cpu_graph_copy>();
+    op.graph->take(cgraph);
+
+    std::lock_guard<std::mutex> lock(a->mutex);
 
     // as with other asynchronous backends, a failure surfaces on the next call. the new graph
     // still runs: dropping it here would silently desynchronize a caller that continues after
@@ -386,7 +403,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     a->status        = GGML_STATUS_SUCCESS;
     a->status_logged = false;
 
-    a->graph = a->take(cgraph);
+    a->queue.push_back(std::move(op));
     a->cv.notify_all();
 
     return status;
@@ -401,7 +418,7 @@ static void ggml_backend_cpu_synchronize(ggml_backend_t backend) {
     }
 
     std::unique_lock<std::mutex> lock(a->mutex);
-    a->cv.wait(lock, [a] { return a->graph == NULL; });
+    a->cv.wait(lock, [a] { return a->idle(); });
 
     // synchronize cannot return a status, so a failed graph is reported here and stays pending
     // for the next graph_compute to return. GGML_STATUS_ABORTED is regular abort callback flow
