@@ -3585,21 +3585,29 @@ void ggml_compute_forward_norm(
 enum ggml_rms_norm_fuse_op {
     GGML_RMS_NORM_FUSE_OP_NONE,
     GGML_RMS_NORM_FUSE_OP_MUL,
+    GGML_RMS_NORM_FUSE_OP_MUL_ADD,
 };
 
 template <ggml_rms_norm_fuse_op FUSE_OP>
 static void ggml_compute_forward_rms_norm_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
-        ggml_tensor * dst_fused = nullptr) {
+        ggml_tensor * dst_fused = nullptr,
+        ggml_tensor * dst_fused2 = nullptr) {
 
     const ggml_tensor * src0 = dst_rms_norm->src[0];
     const ggml_tensor * src1 = nullptr;
+    const ggml_tensor * src2 = nullptr;
     ggml_tensor       * dst  = dst_rms_norm;
 
     if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
         src1 = (dst_fused->src[0] == dst_rms_norm) ? dst_fused->src[1] : dst_fused->src[0];
         dst  = dst_fused;
+    }
+    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+        src1 = (dst_fused->src[0] == dst_rms_norm) ? dst_fused->src[1] : dst_fused->src[0];
+        src2 = (dst_fused2->src[0] == dst_fused) ? dst_fused2->src[1] : dst_fused2->src[0];
+        dst  = dst_fused2;
     }
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
@@ -3635,7 +3643,7 @@ static void ggml_compute_forward_rms_norm_f32(
 
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
-                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL || FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
                     const int64_t i11 = i01 % ne11;
                     const int64_t i12 = i02 % ne12;
                     const int64_t i13 = i03 % ne13;
@@ -3643,6 +3651,12 @@ static void ggml_compute_forward_rms_norm_f32(
 
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
                         y[i00] = x[i00] * scale * w[i00];
+                    }
+                    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+                        // separate pass keeps the rounding identical to the
+                        // unfused mul-then-add sequence (no fma contraction)
+                        const float * a = (float *) ((char *) src2->data + i01*src2->nb[1] + i02*src2->nb[2] + i03*src2->nb[3]);
+                        ggml_vec_add_f32(ne00, y, y, a);
                     }
                 } else {
                     memcpy(y, x, ne00 * sizeof(float));
@@ -3668,6 +3682,69 @@ void ggml_compute_forward_rms_norm(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// Fused RMS_NORM + MUL + ADD: dst = rms_norm(src0) * w + a in a single pass
+void ggml_compute_forward_rms_norm_mul_add_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_rms_norm,
+        ggml_tensor * dst_mul,
+        ggml_tensor * dst_add) {
+
+    GGML_ASSERT(dst_mul != nullptr && dst_add != nullptr);
+    GGML_ASSERT(dst_mul->src[0] == dst_rms_norm || dst_mul->src[1] == dst_rms_norm);
+    GGML_ASSERT(dst_add->src[0] == dst_mul || dst_add->src[1] == dst_mul);
+
+    const ggml_tensor * src0 = dst_rms_norm->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD>(params, dst_rms_norm, dst_mul, dst_add);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// Fused chain of same-shape binary ADD/MUL nodes, each consuming the previous
+// node's result as src0: one pass over the destination replaces the chain's
+// intermediate tensors and the inter-node barriers.
+void ggml_compute_forward_bin_chain_fused(
+        const ggml_compute_params * params,
+        ggml_tensor ** nodes,
+        int n_nodes) {
+
+    ggml_tensor       * dst  = nodes[n_nodes - 1];
+    const ggml_tensor * src0 = nodes[0]->src[0];
+
+    const bool is_add = nodes[0]->op == GGML_OP_ADD;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr  = ggml_nrows(dst);
+    const int64_t ne0 = dst->ne[0];
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t r = ir0; r < ir1; r++) {
+        const float * a = (const float *) ((const char *) src0->data + r * ne0 * sizeof(float));
+        float       * d = (float *)       ((char *)       dst->data  + r * ne0 * sizeof(float));
+
+        for (int k = 0; k < n_nodes; k++) {
+            const float * b = (const float *) ((const char *) nodes[k]->src[1]->data + r * ne0 * sizeof(float));
+            if (is_add) {
+                ggml_vec_add_f32(ne0, d, k == 0 ? a : d, b);
+            } else {
+                ggml_vec_mul_f32(ne0, d, k == 0 ? a : d, b);
+            }
+        }
     }
 }
 

@@ -3085,8 +3085,8 @@ static int ggml_cpu_try_fuse_ops(
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
     if (node->op == GGML_OP_RMS_NORM) {
-        // RMS_NORM + MUL fusion
-        const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+        // RMS_NORM + MUL (+ ADD) fusion
+        const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
         if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
             struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
             const struct ggml_tensor * mul_w = (mul_node->src[0] == node)
@@ -3097,8 +3097,55 @@ static int ggml_cpu_try_fuse_ops(
                 mul_w->ne[0]        == node->ne[0]   &&
                 mul_w->nb[0]        == sizeof(float)) {
 
+                if (ggml_can_fuse(cgraph, node_n, fuse_ops, 3)) {
+                    struct ggml_tensor * add_node = cgraph->nodes[node_n + 2];
+                    const struct ggml_tensor * add_w = (add_node->src[0] == mul_node)
+                        ? add_node->src[1] : add_node->src[0];
+                    if (add_node->type == GGML_TYPE_F32 &&
+                        add_w->type    == GGML_TYPE_F32 &&
+                        ggml_are_same_shape(add_w, add_node) &&
+                        add_w->nb[0]   == sizeof(float)) {
+
+                        ggml_compute_forward_rms_norm_mul_add_fused(params, node, mul_node, add_node);
+                        return 2;
+                    }
+                }
+
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+        // chains of same-shape adds (or muls), each feeding the next through
+        // src0: residual accumulations in MoE graphs are the common case
+        const enum ggml_op chain_ops[2] = { node->op, node->op };
+        int chain = 1;
+        while (chain < 8) {
+            if (!ggml_can_fuse(cgraph, node_n + chain - 1, chain_ops, 2)) {
+                break;
+            }
+            if (cgraph->nodes[node_n + chain]->src[0] != cgraph->nodes[node_n + chain - 1]) {
+                break;
+            }
+            chain++;
+        }
+        if (chain > 1) {
+            bool ok = node->src[0]->type == GGML_TYPE_F32 &&
+                      ggml_is_contiguous(node->src[0])    &&
+                      ggml_are_same_shape(node->src[0], node);
+            for (int k = 0; ok && k < chain; k++) {
+                const struct ggml_tensor * nk = cgraph->nodes[node_n + k];
+                ok = nk->type == GGML_TYPE_F32          &&
+                     ggml_is_contiguous(nk)             &&
+                     nk->src[1]->type == GGML_TYPE_F32  &&
+                     ggml_is_contiguous(nk->src[1])     &&
+                     ggml_are_same_shape(nk->src[1], nk);
+            }
+            if (ok) {
+                ggml_compute_forward_bin_chain_fused(params, &cgraph->nodes[node_n], chain);
+                return chain - 1;
             }
         }
     }
