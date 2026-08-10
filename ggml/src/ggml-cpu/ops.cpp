@@ -10757,8 +10757,8 @@ static void ggml_compute_forward_gated_delta_net_f32(
     int nth = params->nth;
     int ith = params->ith;
 
-    // the (head, seq) units alone can be fewer than the threads (e.g. 16 heads
-    // on 24 threads); split each unit's independent output channels as well
+    // the (head, seq) units alone can be fewer than the threads; split each
+    // unit's independent output channels as well
     // (only worth it on long scans: at a token or two the extra chunk dispatch
     // costs more than the idle threads)
     const int64_t S_v = V->ne[0];
