@@ -476,7 +476,7 @@ static ggml_backend_buffer_type_t * ggml_backend_meta_dev_get_extra_bufts(ggml_b
         }
         result.push_back(&it->second);
     }
-    result.push_back(nullptr); // the list is NULL terminated
+    result.push_back(nullptr);
 
     auto ins = extra_bufts_cache.emplace(dev, std::move(result));
     return ins.first->second.data();

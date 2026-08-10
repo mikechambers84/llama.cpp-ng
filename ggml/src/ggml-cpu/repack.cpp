@@ -4649,8 +4649,8 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         }
     } else if (cur->type == GGML_TYPE_Q5_K) {
         if (ggml_cpu_has_avx2()) {
-            // the AVX2 gemv trails the AVX512-VNNI vec_dot on the row-at-a-time
-            // indirect matmuls of expert tensors and on vocab-sized projections
+            // the AVX2 gemv is slower than the plain vec_dot for the row-at-a-time
+            // indirect matmuls of expert tensors and for vocab-sized projections
             // at low thread counts, so keep those on the plain path
             if (cur->ne[1] % 8 == 0 && cur->ne[2] == 1 && cur->ne[1] < 32768) {
                 return &q5_K_8x8_q8_K;

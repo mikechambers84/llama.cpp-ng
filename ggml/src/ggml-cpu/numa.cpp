@@ -45,7 +45,6 @@ std::vector<int> parse_list(const std::string & list) {
         std::string  tok = list.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
         pos = end == std::string::npos ? list.size() : end + 1;
 
-        // strip whitespace and newlines
         tok.erase(std::remove_if(tok.begin(), tok.end(), [](unsigned char c) { return std::isspace(c); }), tok.end());
         if (tok.empty()) {
             continue;
