@@ -1420,6 +1420,13 @@ UseGgmlGemm2:;
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
+    // for a matrix-vector product every chunk writes a small dense slice of dst, and an unaligned
+    // chunk boundary makes adjacent threads write to the same cache line: with many threads the
+    // resulting ping-pong right before the barrier can several-fold the cost of a small op.
+    // snapping each boundary to a destination cache line keeps the lines private while the
+    // chunk sizes stay balanced to within one line
+    const int64_t line_elems = nr1 == 1 ? 64 / MAX(1, (int64_t) ggml_type_size(dst->type)) : 1;
+
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
 
@@ -1427,8 +1434,12 @@ UseGgmlGemm2:;
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
 
-        const int64_t ir0_start = dr0 * ith0;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+        int64_t ir0_start = dr0 * ith0;
+        int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+        if (line_elems > 1) {
+            ir0_start = (ith0 * nr0 / nchunk0) / line_elems * line_elems;
+            ir0_end   = ith0 + 1 == nchunk0 ? nr0 : ((ith0 + 1) * nr0 / nchunk0) / line_elems * line_elems;
+        }
 
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
@@ -1677,6 +1688,9 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
+        // snap matrix-vector chunk boundaries to destination cache lines, see ggml_compute_forward_mul_mat
+        const int64_t line_elems = nr1 == 1 ? 64 / MAX(1, (int64_t) ggml_type_size(dst->type)) : 1;
+
         int current_chunk = ith;
 
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
@@ -1685,8 +1699,12 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t ith0 = current_chunk % nchunk0;
             const int64_t ith1 = current_chunk / nchunk0;
 
-            const int64_t ir0_start = dr0 * ith0;
-            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+            int64_t ir0_start = dr0 * ith0;
+            int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+            if (line_elems > 1) {
+                ir0_start = (ith0 * nr0 / nchunk0) / line_elems * line_elems;
+                ir0_end   = ith0 + 1 == nchunk0 ? nr0 : ((ith0 + 1) * nr0 / nchunk0) / line_elems * line_elems;
+            }
 
             const int64_t ir1_start = dr1 * ith1;
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
