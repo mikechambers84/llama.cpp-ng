@@ -1411,9 +1411,18 @@ UseGgmlGemm2:;
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
     if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+        // a small matrix-vector product uses only as many threads as have a reasonable amount of
+        // weight data to read (the rest go straight to the barrier, where waiting is cheap): with
+        // many threads the per-thread slices become so small that synchronization and straggler
+        // effects cost more than the parallelism wins, several-fold for MoE expert projections
+        int nth_eff = nth;
+        if (nr1 == 1) {
+            const int64_t work = nr0 * nb01;
+            nth_eff = (int) MIN((int64_t) nth, MAX((int64_t) 1, work / (64*1024)));
+        }
         // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        nchunk0 = nr0 > nr1 ? nth_eff : 1; // parallelize by src0 rows
+        nchunk1 = nr0 > nr1 ? 1 : nth_eff; // parallelize by src1 rows
     }
 
     // The number of elements in each chunk
@@ -1681,6 +1690,9 @@ static void ggml_compute_forward_mul_mat_id(
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
         if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+            // unlike the plain matrix-vector product there is no thread limit here: the expert
+            // matmuls run once per expert and measured neutral to thread count, but worse when
+            // limited (the idle threads have nothing else to overlap with)
             nchunk0 = nr0 > nr1 ? nth : 1;
             nchunk1 = nr0 > nr1 ? 1 : nth;
         }
