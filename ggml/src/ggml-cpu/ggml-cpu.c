@@ -1419,7 +1419,7 @@ UseGgmlGemm2:;
         // a small matrix-vector product uses only as many threads as have a reasonable amount of
         // weight data to read (the rest go straight to the barrier, where waiting is cheap): with
         // many threads the per-thread slices become so small that synchronization and straggler
-        // effects cost more than the parallelism wins, several-fold for MoE expert projections
+        // effects cost more than the parallelism wins
         int nth_eff = nth;
         if (nr1 == 1) {
             const int64_t work = nr0 * nb01;
@@ -1432,7 +1432,7 @@ UseGgmlGemm2:;
 
     // for a matrix-vector product every chunk writes a small dense slice of dst, and an unaligned
     // chunk boundary makes adjacent threads write to the same cache line: with many threads the
-    // resulting ping-pong right before the barrier can several-fold the cost of a small op.
+    // resulting ping-pong right before the barrier can dominate the cost of a small op.
     // snapping each boundary to a destination cache line keeps the lines private while the
     // chunk sizes stay balanced to within one line
     int64_t line_elems = nr1 == 1 ? 64 / MAX(1, (int64_t) ggml_type_size(dst->type)) : 1;
@@ -1709,9 +1709,9 @@ static void ggml_compute_forward_mul_mat_id(
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
         if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            // unlike the plain matrix-vector product there is no thread limit here: the expert
-            // matmuls run once per expert and measured neutral to thread count, but worse when
-            // limited (the idle threads have nothing else to overlap with)
+            // unlike the plain matrix-vector product there is no thread limit here: the
+            // surplus threads of an expert matmul have no other work to overlap with,
+            // so capping them only serializes the op
             nchunk0 = nr0 > nr1 ? nth : 1;
             nchunk1 = nr0 > nr1 ? 1 : nth;
         }
@@ -3085,7 +3085,6 @@ static int ggml_cpu_try_fuse_ops(
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
     if (node->op == GGML_OP_RMS_NORM) {
-        // RMS_NORM + MUL (+ ADD) fusion
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
         if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
             struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];

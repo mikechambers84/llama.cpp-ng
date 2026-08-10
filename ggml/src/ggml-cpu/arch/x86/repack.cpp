@@ -3486,7 +3486,6 @@ void ggml_gemv_q6_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 __m256 acc_row = _mm256_setzero_ps();
 
                 for (int64_t b = 0; b < nb; b++) {
-                    // per-sub-block scale-weighted dot, accumulated in int32
                     __m256i iacc = _mm256_setzero_si256();
 
                     for (int h = 0; h < 2; h++) {
