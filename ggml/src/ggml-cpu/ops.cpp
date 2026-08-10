@@ -10583,6 +10583,7 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
+    int64_t n_jsplit,
     int64_t ir0,
     int64_t ir1) {
 
@@ -10652,9 +10653,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    // the per-token update is independent per output channel j (state row j of
+    // the transposed working layout), so each (head, seq) unit is further split
+    // into n_jsplit row slices to keep every thread busy
+    const int64_t js = S_v / n_jsplit;
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t iv1 = ir % H; // head_index
-        const int64_t iv3 = ir / H; // sequence
+        const int64_t unit = ir / n_jsplit;
+        const int64_t j0   = (ir % n_jsplit) * js;
+        const int64_t j1   = j0 + js;
+
+        const int64_t iv1 = unit % H; // head_index
+        const int64_t iv3 = unit / H; // sequence
 
         const int64_t iq1 = iv1 % neq1;
         const int64_t ik1 = iv1 % nek1;
@@ -10671,7 +10681,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        memcpy(s_out + j0 * S_v, s_in + j0 * S_v, js * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -10693,27 +10703,27 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                     delta[i] = expf(g_d[i]);
                 }
                 // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
-                for (int64_t j = 0; j < S_v; ++j) {
+                for (int64_t j = j0; j < j1; ++j) {
                     ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
                 }
             } else {
-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
+                ggml_vec_scale_f32(js * S_v, s_out + j0 * S_v, expf(g_d[0]));
             }
 
             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
-            for (int64_t j = 0; j < S_v; ++j) {
+            for (int64_t j = j0; j < j1; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
                 delta[j] = (v_d[j] - sum) * beta_val;
             }
 
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
-            for (int64_t j = 0; j < S_v; ++j) {
+            for (int64_t j = j0; j < j1; ++j) {
                 ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
             }
 
             // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
-            for (int64_t j = 0; j < S_v; ++j) {
+            for (int64_t j = j0; j < j1; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
                 attn_data[j] = sum * scale;
@@ -10726,7 +10736,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 if (target_slot >= 0 && target_slot < K) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
                                      (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                    memcpy(curr_state_o + j0 * S_v, s_out + j0 * S_v, js * S_v * sizeof(float));
                 }
             }
         }
@@ -10746,6 +10756,19 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
     int nth = params->nth;
     int ith = params->ith;
+
+    // the (head, seq) units alone can be fewer than the threads (e.g. 16 heads
+    // on 24 threads); split each unit's independent output channels as well
+    // (only worth it on long scans: at a token or two the extra chunk dispatch
+    // costs more than the idle threads)
+    const int64_t S_v = V->ne[0];
+    int64_t n_jsplit = 1;
+    if (V->ne[2] >= 8) {
+        while (nr * n_jsplit < 2 * nth && n_jsplit < S_v / 16 && S_v % (n_jsplit * 2) == 0) {
+            n_jsplit *= 2;
+        }
+    }
+    nr *= n_jsplit;
 
     // 4x chunks per thread
     int nth_scaled = nth * 4;
@@ -10770,7 +10793,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
         const int64_t ir0 = dr * current_chunk;
         const int64_t ir1 = MIN(ir0 + dr, nr);
 
-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
+        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, n_jsplit, ir0, ir1);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
 }
