@@ -513,6 +513,11 @@ struct ggml_compute_state {
     bool cpumask[GGML_MAX_N_THREADS];
     struct ggml_threadpool * threadpool;
     int ith;
+
+    // per-node profiling scratch, parity-indexed so thread 0 can fold one
+    // node while the team writes the next (see GGML_CPU_PROFILE)
+    int64_t prof_work[2];
+    int64_t prof_fin[2];
 };
 
 // Helpers for polling loops
@@ -3087,6 +3092,178 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+//
+// per-op profiler (GGML_CPU_PROFILE)
+//
+// when the GGML_CPU_PROFILE environment variable is set, every compute thread
+// timestamps each node around the dispatch, and after the trailing barrier
+// thread 0 folds the interval into a process-wide table keyed by the op and
+// the operand shapes. the table is printed at process exit, to stderr or to
+// the file named by the variable. collection is off by default and costs one
+// predictable branch per node.
+
+static bool ggml_cpu_profile = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static const char * ggml_cpu_profile_path = NULL;
+
+struct ggml_cpu_profile_entry {
+    // key: the fields up to and including `fused` (zero-initialized, so the
+    // padding is stable for hashing/comparison)
+    enum ggml_op   op;
+    int32_t        subop;      // unary/glu op, -1 otherwise
+    enum ggml_type src0_type;  // GGML_TYPE_COUNT when there is no src0
+    int64_t        src0_ne[3];
+    int64_t        n_cols;     // dst ne[1]
+    bool           fused;
+
+    int64_t count;
+    int64_t wall_us;  // critical path: dispatch on thread 0 -> after the barrier
+    int64_t work_us;  // per-thread compute time, summed over the threads
+    int64_t tail_us;  // barrier exit time after the slowest thread finished
+    int64_t thr_us;   // wall_us * n_threads, accumulated per fold
+};
+
+#define GGML_CPU_PROFILE_MAX_ENTRIES 1024
+
+static struct ggml_cpu_profile_entry ggml_cpu_profile_table[GGML_CPU_PROFILE_MAX_ENTRIES];
+static int64_t ggml_cpu_profile_dropped = 0;
+
+static void ggml_cpu_profile_fold(
+        const struct ggml_threadpool * tp,
+        const struct ggml_tensor     * node,
+        bool fused, int64_t t0, int64_t t_bar, int nth, int slot) {
+    int64_t work    = 0;
+    int64_t max_fin = 0;
+    for (int i = 0; i < nth; i++) {
+        const struct ggml_compute_state * w = &tp->workers[i];
+        work += w->prof_work[slot];
+        if (w->prof_fin[slot] > max_fin) {
+            max_fin = w->prof_fin[slot];
+        }
+    }
+
+    struct ggml_cpu_profile_entry key = {0};
+    key.op        = node->op;
+    key.subop     = node->op == GGML_OP_UNARY ? (int32_t) ggml_get_unary_op(node) :
+                    node->op == GGML_OP_GLU   ? (int32_t) ggml_get_glu_op(node)   : -1;
+    key.src0_type = node->src[0] ? node->src[0]->type : GGML_TYPE_COUNT;
+    if (node->src[0]) {
+        key.src0_ne[0] = node->src[0]->ne[0];
+        key.src0_ne[1] = node->src[0]->ne[1];
+        key.src0_ne[2] = node->src[0]->ne[2];
+    }
+    key.n_cols = node->ne[1];
+    key.fused  = fused;
+
+    const size_t key_size = offsetof(struct ggml_cpu_profile_entry, count);
+
+    // FNV-1a over the key bytes
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < key_size; i++) {
+        h = (h ^ ((const uint8_t *) &key)[i]) * 0x100000001b3ULL;
+    }
+
+    ggml_critical_section_start();
+    for (size_t probe = 0; probe < GGML_CPU_PROFILE_MAX_ENTRIES; probe++) {
+        struct ggml_cpu_profile_entry * e =
+            &ggml_cpu_profile_table[(h + probe) % GGML_CPU_PROFILE_MAX_ENTRIES];
+        if (e->count == 0) {
+            memcpy(e, &key, key_size);
+        } else if (memcmp(e, &key, key_size) != 0) {
+            continue;
+        }
+        e->count   += 1;
+        e->wall_us += t_bar - t0;
+        e->work_us += work;
+        e->tail_us += t_bar - max_fin;
+        e->thr_us  += (t_bar - t0) * nth;
+        ggml_critical_section_end();
+        return;
+    }
+    ggml_cpu_profile_dropped++;
+    ggml_critical_section_end();
+}
+
+static int ggml_cpu_profile_cmp(const void * a, const void * b) {
+    const struct ggml_cpu_profile_entry * ea = *(const struct ggml_cpu_profile_entry * const *) a;
+    const struct ggml_cpu_profile_entry * eb = *(const struct ggml_cpu_profile_entry * const *) b;
+    return ea->wall_us < eb->wall_us ? 1 : ea->wall_us > eb->wall_us ? -1 : 0;
+}
+
+static void ggml_cpu_profile_dump(void) {
+    FILE * f = stderr;
+    if (ggml_cpu_profile_path) {
+        f = fopen(ggml_cpu_profile_path, "w");
+        if (!f) {
+            f = stderr;
+        }
+    }
+
+    const struct ggml_cpu_profile_entry * entries[GGML_CPU_PROFILE_MAX_ENTRIES];
+    int n_entries = 0;
+
+    int64_t tot_wall = 0;
+    int64_t tot_work = 0;
+    int64_t tot_thr  = 0;
+    int64_t tot_tail = 0;
+    for (int i = 0; i < GGML_CPU_PROFILE_MAX_ENTRIES; i++) {
+        const struct ggml_cpu_profile_entry * e = &ggml_cpu_profile_table[i];
+        if (e->count > 0) {
+            entries[n_entries++] = e;
+            tot_wall += e->wall_us;
+            tot_work += e->work_us;
+            tot_thr  += e->thr_us;
+            tot_tail += e->tail_us;
+        }
+    }
+    qsort(entries, n_entries, sizeof(entries[0]), ggml_cpu_profile_cmp);
+
+    fprintf(f, "\n== ggml cpu profile ==\n");
+    fprintf(f, "total: %.1f ms across the nodes, thread utilization %.1f%%, barrier tail %.1f%%\n",
+            tot_wall / 1e3,
+            tot_thr  > 0 ? 100.0 * tot_work / tot_thr  : 0.0,
+            tot_wall > 0 ? 100.0 * tot_tail / tot_wall : 0.0);
+    if (ggml_cpu_profile_dropped > 0) {
+        fprintf(f, "warning: %" PRId64 " node executions not attributed (profile table full)\n",
+                ggml_cpu_profile_dropped);
+    }
+    fprintf(f, "%-24s %-8s %-22s %6s %10s %6s %9s %6s %6s\n",
+            "op", "type", "src0 x cols", "count", "total ms", "%", "avg us", "util%", "tail%");
+    for (int i = 0; i < n_entries; i++) {
+        const struct ggml_cpu_profile_entry * e = entries[i];
+
+        char name[64];
+        snprintf(name, sizeof(name), "%s%s%s%s", ggml_op_name(e->op),
+                 e->subop < 0             ? "" : "/",
+                 e->subop < 0             ? "" :
+                 e->op == GGML_OP_UNARY   ? ggml_unary_op_name((enum ggml_unary_op) e->subop) :
+                                            ggml_glu_op_name((enum ggml_glu_op) e->subop),
+                 e->fused ? "+fused" : "");
+
+        char shape[64];
+        if (e->src0_type == GGML_TYPE_COUNT) {
+            snprintf(shape, sizeof(shape), "- x %" PRId64, e->n_cols);
+        } else {
+            snprintf(shape, sizeof(shape), "%" PRId64 "x%" PRId64 "x%" PRId64 " x %" PRId64,
+                     e->src0_ne[0], e->src0_ne[1], e->src0_ne[2], e->n_cols);
+        }
+
+        fprintf(f, "%-24s %-8s %-22s %6" PRId64 " %10.1f %6.2f %9.1f %6.1f %6.1f\n",
+                name,
+                e->src0_type == GGML_TYPE_COUNT ? "-" : ggml_type_name(e->src0_type),
+                shape,
+                e->count,
+                e->wall_us / 1e3,
+                tot_wall   > 0 ? 100.0 * e->wall_us / tot_wall   : 0.0,
+                (double) e->wall_us / e->count,
+                e->thr_us  > 0 ? 100.0 * e->work_us / e->thr_us  : 0.0,
+                e->wall_us > 0 ? 100.0 * e->tail_us / e->wall_us : 0.0);
+    }
+
+    if (f != stderr) {
+        fclose(f);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3115,6 +3292,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const bool prof = ggml_cpu_profile;
+    int  prof_slot    = 0;
+    bool prof_pending = false;
+    int64_t prof_t0   = 0;
+    bool prof_fused   = false;
+    const struct ggml_tensor * prof_node = NULL;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3127,6 +3311,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        if (prof) {
+            prof_t0 = ggml_time_us();
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3134,6 +3322,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (prof) {
+            const int64_t fin = ggml_time_us();
+            state->prof_work[prof_slot] = fin - prof_t0;
+            state->prof_fin[prof_slot]  = fin;
+            prof_node    = node;
+            prof_fused   = n_fused > 0;
+            prof_pending = true;
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3144,6 +3341,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (prof) {
+                // the barrier ordered the team's timestamp writes before this
+                // fold; the team starts the next node on the other slot
+                if (state->ith == 0) {
+                    ggml_cpu_profile_fold(tp, prof_node, prof_fused, prof_t0, ggml_time_us(), params.nth, prof_slot);
+                }
+                prof_slot ^= 1;
+                prof_pending = false;
+            }
         }
     }
 
@@ -3154,6 +3360,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (prof && prof_pending && state->ith == 0) {
+        // the last node has no in-loop barrier; fold it after the trailing one
+        ggml_cpu_profile_fold(tp, prof_node, prof_fused, prof_t0, ggml_time_us(), params.nth, prof_slot);
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
@@ -3916,6 +4127,18 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            const char * env = getenv("GGML_CPU_PROFILE");
+            if (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) {
+                ggml_cpu_profile = true;
+                if (strcmp(env, "1") != 0) {
+                    // any other value names the file to dump to instead of stderr
+                    ggml_cpu_profile_path = env;
+                }
+                atexit(ggml_cpu_profile_dump);
+            }
         }
 
         is_first_call = false;
