@@ -49,6 +49,17 @@ using block_q8_0x4 = block<8, 4>;
 using block_q8_0x8 = block<8, 8>;
 using block_q8_0x16 = block<8, 16>;
 
+struct block_q5_0x8 {
+    ggml_half d[8];      // deltas for 8 q5_0 blocks
+    // high bits, rearranged: byte g*8 + r holds the high bits of quants
+    // 8g..8g+7 of row r, so the 8 rows of one quant group form a contiguous
+    // 64-bit word that maps 1:1 onto the byte lanes of the unpacked group
+    uint8_t   qh[4 * 8];
+    uint8_t   qs[16 * 8];  // low nibbles, interleaved in 8-byte chunks per row
+};
+
+static_assert(sizeof(block_q5_0x8) == 8 * sizeof(ggml_half) + 4 * 8 + 16 * 8, "wrong q5_0x8 block size/padding");
+
 struct block_q4_Kx8 {
     ggml_half d[8];      // super-block scale for quantized scales
     ggml_half dmin[8];   // super-block scale for quantized mins
@@ -110,6 +121,92 @@ struct block_q8_Kx4 {
 
 static_assert(sizeof(block_q8_Kx4) == sizeof(float) * 4 + QK_K * 4 + (QK_K / 4) * sizeof(int16_t), "wrong q8_K block size/padding");
 
+struct block_iq2_xsx8 {
+    ggml_half d[8];                // per-row super-block scales
+    // grid-index/sign words regrouped as [sub-block][group][row]: the 8 rows'
+    // words of one 32-weight sub-block form one contiguous 64-byte span, and
+    // the 8 grid entries of one 8-weight group are adjacent for row-major
+    // assembly of a 64-byte lane vector
+    uint16_t  qs[QK_K / 8 * 8];
+    uint8_t   scales[QK_K / 32 * 8];  // sub-block scale bytes, [sub-block][row]
+};
+
+static_assert(sizeof(block_iq2_xsx8) == 8 * sizeof(ggml_half) + QK_K / 4 * 8 + QK_K / 32 * 8,
+              "wrong iq2_xs block size/padding");
+
+struct block_iq3_xxsx8 {
+    ggml_half d[8];                 // per-row super-block scales
+    // grid index bytes regrouped as [sub-block][group][row][2]: the two
+    // entries of one 8-weight group stay adjacent for pairwise assembly
+    uint8_t   qs[QK_K / 4 * 8];
+    // the per-sub-block sign/scale words regrouped as [sub-block][row]
+    uint8_t   sas[QK_K / 8 * 8];
+};
+
+static_assert(sizeof(block_iq3_xxsx8) == 8 * sizeof(ggml_half) + QK_K / 4 * 8 + QK_K / 8 * 8,
+              "wrong iq3_xxs block size/padding");
+
+struct block_iq1_sx8 {
+    ggml_half d[8];                // per-row super-block scales
+    uint16_t  qh[QK_K / 32 * 8];   // high index bits/scale/delta words, [sub-block][row]
+    uint8_t   qs[QK_K / 8 * 8];    // low index bytes, [sub-block][row][4]
+};
+
+static_assert(sizeof(block_iq1_sx8) == 8 * sizeof(ggml_half) + QK_K / 32 * 8 * 2 + QK_K / 8 * 8,
+              "wrong iq1_s block size/padding");
+
+struct block_iq2_xxsx8 {
+    ggml_half d[8];               // per-row super-block scales
+    uint8_t   qs[QK_K / 8 * 8];   // grid index bytes, [sub-block][row][4]
+    uint8_t   sas[QK_K / 8 * 8];  // sign/scale words, [sub-block][row]
+};
+
+static_assert(sizeof(block_iq2_xxsx8) == 8 * sizeof(ggml_half) + QK_K / 4 * 8,
+              "wrong iq2_xxs block size/padding");
+
+struct block_iq4_xsx8 {
+    ggml_half d[8];                    // per-row super-block scales
+    uint16_t  scales_h[8];             // scale high bits, per row
+    uint8_t   scales_l[QK_K / 64 * 8]; // scale low nibbles, [row][4]
+    uint8_t   qs[QK_K / 2 * 8];        // nibbles, [sub-block][half][row][8]
+};
+
+static_assert(sizeof(block_iq4_xsx8) == 8 * sizeof(ggml_half) + 8 * 2 + QK_K / 64 * 8 + QK_K / 2 * 8,
+              "wrong iq4_xs block size/padding");
+
+struct block_iq2_sx8 {
+    ggml_half d[8];                   // per-row super-block scales
+    uint8_t   qs[QK_K / 8 * 8];       // idx low bytes, [sub-block][row][4]
+    uint8_t   qh[QK_K / 32 * 8];      // idx high pairs, [sub-block][row]
+    uint8_t   signs[QK_K / 8 * 8];    // sign bytes, [sub-block][group][row]
+    uint8_t   scales[QK_K / 32 * 8];  // scale nibbles, [sub-block][row]
+};
+
+static_assert(sizeof(block_iq2_sx8) == 8 * sizeof(ggml_half) + (QK_K / 4 + QK_K / 16) * 8,
+              "wrong iq2_s block size/padding");
+
+struct block_iq3_sx8 {
+    ggml_half d[8];                     // per-row super-block scales
+    uint8_t   qs[QK_K / 4 * 8];         // idx low bytes, [sub-block][group][row][2]
+    uint8_t   qh[QK_K / 32 * 8];        // idx high bits, [sub-block][row]
+    uint8_t   signs[QK_K / 8 * 8];      // sign bytes, [sub-block][group][row]
+    uint8_t   scales[IQ3S_N_SCALE * 8]; // scale nibbles, [sub-block pair][row]
+};
+
+static_assert(sizeof(block_iq3_sx8) == 8 * sizeof(ggml_half) + 13 * (QK_K / 32) * 8 + IQ3S_N_SCALE * 8,
+              "wrong iq3_s block size/padding");
+
+struct block_iq1_mx8 {
+    // scale words kept verbatim, [pair of sub-blocks][row]; the per-row fp16
+    // super-block scale hides in the top nibbles of the four words
+    uint16_t scales[QK_K / 64 * 8];
+    uint8_t  qh[QK_K / 16 * 8];  // idx high bits + delta signs, [sub-block][row][2]
+    uint8_t  qs[QK_K / 8 * 8];   // idx low bytes, [sub-block][row][4]
+};
+
+static_assert(sizeof(block_iq1_mx8) == (QK_K / 32 + QK_K / 16 + QK_K / 8) * 8,
+              "wrong iq1_m block size/padding");
+
 struct block_iq4_nlx4 {
     ggml_half d[4];            // deltas for 4 iq4_nl blocks
     uint8_t   qs[QK4_NL * 2];  // nibbles / quants for 4 iq4_nl blocks
@@ -166,6 +263,16 @@ void ggml_gemv_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q8_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q8_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_q8_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq3_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq4_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq2_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq1_m_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq1_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q4_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
@@ -182,6 +289,16 @@ void ggml_gemm_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_gemm_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_q8_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_q5_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq3_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq4_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq2_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq3_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq1_m_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq1_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 #if defined __riscv_zvfh
 void ggml_quantize_mat_q8_0_4x1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -218,6 +335,16 @@ void ggml_gemv_mxfp4_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
 void ggml_gemv_mxfp4_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q8_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q8_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_q8_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_q5_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq2_xs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq3_xxs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq2_xxs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq4_xs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq2_s_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq3_s_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq1_m_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemv_iq1_s_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q4_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q4_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q4_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
@@ -234,6 +361,16 @@ void ggml_gemm_mxfp4_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
 void ggml_gemm_mxfp4_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemm_q8_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_q8_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_q5_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq2_xs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq3_xxs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq2_xxs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq4_xs_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq2_s_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq3_s_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq1_m_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+void ggml_gemm_iq1_s_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 #if defined __riscv_zvfh
 void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);

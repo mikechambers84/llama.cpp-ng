@@ -45,6 +45,8 @@ void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, s
 void ggml_compute_forward_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
+void ggml_compute_forward_rms_norm_mul_add_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul, struct ggml_tensor * dst_add);
+void ggml_compute_forward_bin_chain_fused(const struct ggml_compute_params * params, struct ggml_tensor ** nodes, int n_nodes);
 void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);

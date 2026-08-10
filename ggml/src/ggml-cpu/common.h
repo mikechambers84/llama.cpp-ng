@@ -87,6 +87,36 @@ static std::pair<int64_t, int64_t> get_thread_range(const struct ggml_compute_pa
     return {ir0, ir1};
 }
 
+// Split an (nr rows x nc columns) op over the threads. With at least as many
+// rows as threads each thread gets a range of whole rows, like
+// get_thread_range. With fewer rows than threads the rows are shared instead:
+// every thread visits all rows but only a slice of the columns, so an op with
+// a single long row still uses the whole team. Slices are kept at least
+// min_cols wide so that a small op is not scattered over many threads.
+struct ggml_thread_tile {
+    int64_t ir0, ir1; // row range
+    int64_t ic0, ic1; // column range
+};
+
+static inline ggml_thread_tile get_thread_tile(const struct ggml_compute_params * params,
+        int64_t nr, int64_t nc, int64_t min_cols = 1024) {
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+
+    if (nr >= nth || nc < 2*min_cols) {
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = MIN(dr*ith, nr);
+        return {ir0, MIN(ir0 + dr, nr), 0, nc};
+    }
+
+    // keep the slice starts aligned to the widest SIMD step, so that the
+    // per-element code path (vector body vs scalar tail) and therefore the
+    // result of a vectorized op match the unsliced computation exactly
+    const int64_t dc  = GGML_PAD(MAX((nc + nth - 1)/nth, min_cols), 64);
+    const int64_t ic0 = MIN(dc*ith, nc);
+    return {0, nr, ic0, MIN(ic0 + dc, nc)};
+}
+
 struct ggml_fa_tile_config {
     static constexpr size_t Q  = GGML_FA_TILE_Q;
     static constexpr size_t KV = GGML_FA_TILE_KV;
