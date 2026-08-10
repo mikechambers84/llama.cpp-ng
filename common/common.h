@@ -549,6 +549,7 @@ struct common_params {
     bool usage             = false; // print usage
     bool completion        = false; // print source-able completion script
     bool list_devices      = false; // print available devices and exit, after parsing
+    std::vector<std::string> no_gpu_warnings; // held back until it is known whether --numa split provides devices
     bool use_color         = false; // use color to distinguish generations and inputs
     bool special           = false; // enable special token output
     bool interactive       = false; // interactive mode

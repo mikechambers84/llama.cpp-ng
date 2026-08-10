@@ -842,11 +842,22 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // exist only after initialization, and this way the arguments work in any order. skipped for
     // usage/completion, which exit without using them
     if (!params.usage && !params.completion) {
+        bool numa_devices = false;
         if (params.numa == GGML_NUMA_STRATEGY_SPLIT) {
             // the CPU backend is a shared library in some builds, it has to be loaded before it can be asked
             ggml_backend_load_all();
-            if (llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+            const enum llama_numa_init_status status = llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT);
+            if (status == LLAMA_NUMA_INIT_STATUS_FAILED) {
                 throw std::runtime_error("--numa split could not be initialized");
+            }
+            numa_devices = status == LLAMA_NUMA_INIT_STATUS_SUCCESS;
+        }
+
+        // with the NUMA node devices the GPU oriented options work as usual, without them the
+        // handlers' warnings about their lack of effect hold and are printed now
+        if (!numa_devices) {
+            for (const auto & warning : params.no_gpu_warnings) {
+                fprintf(stderr, "%s", warning.c_str());
             }
         }
 
@@ -2729,9 +2740,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_gpu_layers = std::stoi(value);
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
-                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
-                fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
+                params.no_gpu_warnings.push_back(
+                    "warning: no usable GPU found, --gpu-layers option will be ignored\n"
+                    "warning: one possible reason is that llama.cpp was compiled without GPU support\n"
+                    "warning: consult docs/build.md for compilation instructions\n");
             }
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
@@ -2755,7 +2767,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the split mode has no effect.\n");
+                params.no_gpu_warnings.push_back("warning: llama.cpp was compiled without support for GPU offload. Setting the split mode has no effect.\n");
             }
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
@@ -2782,7 +2794,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 }
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting a tensor split has no effect.\n");
+                params.no_gpu_warnings.push_back("warning: llama.cpp was compiled without support for GPU offload. Setting a tensor split has no effect.\n");
             }
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
@@ -2792,7 +2804,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.main_gpu = value;
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the main GPU has no effect.\n");
+                params.no_gpu_warnings.push_back("warning: llama.cpp was compiled without support for GPU offload. Setting the main GPU has no effect.\n");
             }
         }
     ).set_env("LLAMA_ARG_MAIN_GPU"));
@@ -4095,9 +4107,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.draft.n_gpu_layers = std::stoi(value);
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: no usable GPU found, --gpu-layers-draft option will be ignored\n");
-                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
-                fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
+                params.no_gpu_warnings.push_back(
+                    "warning: no usable GPU found, --gpu-layers-draft option will be ignored\n"
+                    "warning: one possible reason is that llama.cpp was compiled without GPU support\n"
+                    "warning: consult docs/build.md for compilation instructions\n");
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
