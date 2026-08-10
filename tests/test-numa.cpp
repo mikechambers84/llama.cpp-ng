@@ -77,7 +77,7 @@ int main() {
 
     printf("parse_topology\n");
     {
-        // this machine: 2 nodes, interleaved CPU numbering, hyperthreads at +48
+        // emulated topology: 2 nodes, interleaved CPU numbering, hyperthreads at +48
         const fs::path root = make_sysfs("2node", "0-1", {{0, "0-1,48-49", 8000}, {1, "2-3,50-51", 8000}}, 48);
 
         const auto nodes = parse_topology(root.string(), {});
@@ -217,7 +217,6 @@ int main() {
             check(status == LLAMA_NUMA_INIT_STATUS_SUCCESS, "split initialized");
             check(ggml_backend_dev_count() == n_dev_before + topology().size(), "one device per node registered");
 
-            // the device that was there before must still be the one everything falls back to
             ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             check(std::string(ggml_backend_dev_name(cpu)) == "CPU", "dev_by_type still returns the plain CPU device");
 
@@ -248,7 +247,6 @@ int main() {
                 check(!props.caps.buffer_from_host_ptr, expected + " does not map host pointers");
                 check(props.memory_total > 0 && props.memory_total < (size_t) -1, expected + " reports node memory");
 
-                // no node device may accept the buffers of another node
                 for (const auto & other : topology()) {
                     if (other.id == n.id) {
                         continue;
@@ -259,7 +257,6 @@ int main() {
                             expected + " rejects the buffer type of " + other_name);
                 }
 
-                // the fallback device still takes everything
                 check(ggml_backend_dev_supports_buft(cpu, buft), "the plain CPU device accepts " + expected + " buffers");
             }
 

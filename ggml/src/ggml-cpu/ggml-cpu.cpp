@@ -196,7 +196,7 @@ struct ggml_backend_cpu_async {
     std::mutex              mutex;
     std::condition_variable cv;
 
-    std::deque<ggml_backend_cpu_async_op> queue;   // pending work
+    std::deque<ggml_backend_cpu_async_op> queue;
     bool                    running = false;       // an op popped off the queue is being executed
     enum ggml_status        status  = GGML_STATUS_SUCCESS; // of the last failed graph, kept until a caller sees it
     bool                    status_logged = false; // a pending failure was already reported by synchronize
@@ -847,9 +847,9 @@ static ggml_threadpool_t ggml_backend_cpu_numa_threadpool(const ggml_backend_cpu
     tpp.paused = true;
 
     // one worker per CPU while the pool fits on distinct physical cores: floating workers can be
-    // co-scheduled onto SMT siblings while a core idles, which straggles every barrier (measured
-    // ~6% of tg). once the pool spills onto SMT siblings anyway, the fixed assignment loads the
-    // cores unevenly and letting the scheduler balance within the node is slightly better
+    // co-scheduled onto SMT siblings while a core idles, which straggles every barrier. once the
+    // pool spills onto SMT siblings anyway, the fixed assignment loads the cores unevenly and
+    // letting the scheduler balance within the node is slightly better
     tpp.strict_cpu = n_threads <= ctx->n_cores;
 
     return ggml_threadpool_new(&tpp);
@@ -884,7 +884,6 @@ static ggml_backend_t ggml_backend_cpu_device_init_backend(ggml_backend_dev_t de
             return NULL;
         }
 
-        // one thread per physical core until a thread count is set
         ctx->n_threads = dev_ctx->n_cores;
 
         ctx->async = new ggml_backend_cpu_async;
@@ -1287,7 +1286,7 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 // few tens of KiB per boundary, where the fallback's fixed dispatch cost dominates the token time.
 
 // prompt-sized boundary tensors are reduced faster by the fallback, whose ADDs run on the node
-// thread pools; a single thread only wins while the data is small (see the bench in the M9 commit)
+// thread pools; a single thread only wins while the data is small
 static const size_t GGML_CPU_COMM_MAX_BYTES = 1024*1024;
 
 struct ggml_backend_cpu_comm {
