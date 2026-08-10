@@ -4575,13 +4575,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize);
 
+        // a permuted src1 was quantized row by row into the plain layout, which the
+        // 4-row-packed gemm cannot read (see forward_mul_mat)
+        const bool src1_rows_cont = nb11 == ggml_row_size(GGML_TYPE_F32, ne10);
+
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
-        if (nrows > 3) {
+        int64_t gemm_rows = 0;
+        if (nrows > 3 && src1_rows_cont) {
+            gemm_rows = nrows - (nrows % 4);
             gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr) + src0_start, nb1 / nb0,
                                                              src0_ptr + src0_start * nb01, src1_ptr,
-                                                             nrows - (nrows % 4), ncols);
+                                                             gemm_rows, ncols);
         }
-        for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
+        for (int64_t iter = gemm_rows; iter < nrows; iter++) {
             gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
                                                              ne01, src0_ptr + src0_start * nb01,
                                                              src1_ptr + (src1_col_stride * iter), 1 /* nrows */, ncols);
@@ -4617,7 +4623,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-        GGML_ASSERT(ggml_n_dims(op->src[0]) == 2);
+        GGML_ASSERT(ggml_n_dims(op->src[0]) <= 3);
+        GGML_ASSERT(ne12 % ne02 == 0);
         // GGML_ASSERT(ggml_n_dims(op->src[1]) == 2);
 
         char *       wdata = static_cast<char *>(params->wdata);
@@ -4631,16 +4638,23 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
+        // The 4-row packing reads 4 consecutive rows, so it requires a dense src1 row layout;
+        // a permuted src1 is quantized row by row into the plain layout and computed with gemv only.
+        const bool src1_rows_cont = nb11 == ggml_row_size(GGML_TYPE_F32, ne10);
+
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
-            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
-                                                            (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+            const int64_t i11_processed = src1_rows_cont ? ne11 - ne11 % 4 : 0;
+
+            if (src1_rows_cont) {
+                for (int64_t i11 = ith * 4; i11 < i11_processed; i11 += nth * 4) {
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
+                                                                (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
+                }
             }
 
-            const int64_t i11_processed = ne11 - ne11 % 4;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
@@ -4649,8 +4663,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
 
-        // 4x chunks per thread
-        const int64_t nr0 = ggml_nrows(op->src[0]);
+        // 4x chunks per thread; the rows of one src0 plane are chunked and the
+        // planes are covered by the src1 plane chunks (nchunk1), with
+        // forward_mul_mat_one_chunk selecting the matching src0 plane
+        const int64_t nr0 = ne01;
 
         int     nth_scaled  = nth * 4;
         int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
@@ -5146,7 +5162,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
         if (    op->op == GGML_OP_MUL_MAT &&
                 op->src[0]->buffer &&
-                (ggml_n_dims(op->src[0]) == 2) &&
+                (ggml_n_dims(op->src[0]) == 2 ||
+                 // batched: the planes of src1 must map 1:1 or broadcast onto the src0 planes
+                 (ggml_n_dims(op->src[0]) == 3 && op->src[0]->ne[3] == 1 && op->src[1]->ne[3] == 1 &&
+                  op->src[1]->ne[2] % op->src[0]->ne[2] == 0)) &&
                 op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
                 ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
