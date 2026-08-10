@@ -1687,6 +1687,67 @@ void ggml_gemv_iq2_xxs_8x8_q8_K_generic(int                        n,
     }
 }
 
+// 6-bit sub-block scale of iq4_xs, biased by -32
+static inline int iq4_xsx8_scale(uint16_t sh, const uint8_t * sl, int sb) {
+    return (((sl[sb / 2] >> (4 * (sb % 2))) & 0xf) | (((sh >> (2 * sb)) & 3) << 4)) - 32;
+}
+
+void ggml_gemv_iq4_xs_8x8_q8_K_generic(int                        n,
+                                       float * GGML_RESTRICT      s,
+                                       size_t                     bs,
+                                       const void * GGML_RESTRICT vx,
+                                       const void * GGML_RESTRICT vy,
+                                       int                        nr,
+                                       int                        nc) {
+    const int qk                = QK_K;
+    const int nb                = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert(nr == 1);
+    assert(n % qk == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    float sumf[8];
+    int   sumi[8];
+
+    const block_q8_K * a_ptr = (const block_q8_K *) vy;
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iq4_xsx8 * b_ptr = (const block_iq4_xsx8 *) vx + (x * nb);
+
+        for (int j = 0; j < ncols_interleaved; j++) {
+            sumf[j] = 0.0f;
+        }
+        for (int l = 0; l < nb; l++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+                sumi[j] = 0;
+            }
+            for (int sb = 0; sb < QK_K / 32; sb++) {
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    const int ls = iq4_xsx8_scale(b_ptr[l].scales_h[j], b_ptr[l].scales_l + j * 4, sb);
+                    int dot = 0;
+                    for (int h = 0; h < 2; h++) {
+                        for (int i = 0; i < 8; i++) {
+                            const uint8_t q = b_ptr[l].qs[sb * 128 + h * 64 + j * 8 + i];
+                            dot += kvalues_iq4nl[q & 0xf]  * a_ptr[l].qs[sb * 32 + h * 8 + i]
+                                 + kvalues_iq4nl[q >>  4]  * a_ptr[l].qs[sb * 32 + 16 + h * 8 + i];
+                        }
+                    }
+                    sumi[j] += ls * dot;
+                }
+            }
+            for (int j = 0; j < ncols_interleaved; j++) {
+                sumf[j] += sumi[j] * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * a_ptr[l].d;
+            }
+        }
+        for (int j = 0; j < ncols_interleaved; j++) {
+            s[x * ncols_interleaved + j] = sumf[j];
+        }
+    }
+}
+
 void ggml_gemv_q8_0_8x8_q8_0_generic(int                        n,
                                      float * GGML_RESTRICT      s,
                                      size_t                     bs,
@@ -3056,6 +3117,70 @@ void ggml_gemm_iq2_xxs_8x8_q8_K_generic(int                        n,
     }
 }
 
+void ggml_gemm_iq4_xs_8x8_q8_K_generic(int                        n,
+                                       float * GGML_RESTRICT      s,
+                                       size_t                     bs,
+                                       const void * GGML_RESTRICT vx,
+                                       const void * GGML_RESTRICT vy,
+                                       int                        nr,
+                                       int                        nc) {
+    const int qk                = QK_K;
+    const int nb                = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert(n % qk == 0);
+    assert(nr % 4 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    float sumf[4][8];
+    int   sumi[4][8];
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + (y * nb);
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_iq4_xsx8 * b_ptr = (const block_iq4_xsx8 *) vx + (x * nb);
+            for (int m = 0; m < 4; m++) {
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    sumf[m][j] = 0.0f;
+                }
+            }
+            for (int l = 0; l < nb; l++) {
+                for (int m = 0; m < 4; m++) {
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        sumi[m][j] = 0;
+                    }
+                }
+                for (int sb = 0; sb < QK_K / 32; sb++) {
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        const int ls = iq4_xsx8_scale(b_ptr[l].scales_h[j], b_ptr[l].scales_l + j * 4, sb);
+                        for (int m = 0; m < 4; m++) {
+                            int dot = 0;
+                            for (int h = 0; h < 2; h++) {
+                                for (int i = 0; i < 8; i++) {
+                                    const uint8_t q = b_ptr[l].qs[sb * 128 + h * 64 + j * 8 + i];
+                                    dot += kvalues_iq4nl[q & 0xf] * a_ptr[l].qs[((sb * 4 + h) * 4 + m) * 8 + i]
+                                         + kvalues_iq4nl[q >>  4] * a_ptr[l].qs[((sb * 4 + 2 + h) * 4 + m) * 8 + i];
+                                }
+                            }
+                            sumi[m][j] += ls * dot;
+                        }
+                    }
+                }
+                for (int m = 0; m < 4; m++) {
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        sumf[m][j] += sumi[m][j] * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * a_ptr[l].d[m];
+                    }
+                }
+            }
+            for (int m = 0; m < 4; m++) {
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+                }
+            }
+        }
+    }
+}
+
 void ggml_gemm_q8_0_8x8_q8_0_generic(int                        n,
                                      float * GGML_RESTRICT      s,
                                      size_t                     bs,
@@ -4367,6 +4492,61 @@ static block_iq2_xsx8 make_block_iq2_xsx8(block_iq2_xs * in, unsigned int blck_s
     return out;
 }
 
+static block_iq4_xsx8 make_block_iq4_xsx8(block_iq4_xs * in, unsigned int blck_size_interleave) {
+    GGML_ASSERT(blck_size_interleave == 8);
+    block_iq4_xsx8 out;
+
+    for (int i = 0; i < 8; i++) {
+        out.d[i]        = in[i].d;
+        out.scales_h[i] = in[i].scales_h;
+        memcpy(out.scales_l + i * 4, in[i].scales_l, 4);
+    }
+
+    // nibble bytes as [sub-block][half][row][8]: the low nibbles of one half
+    // hold weights h*8.., the high nibbles weights 16+h*8..
+    for (int sb = 0; sb < QK_K / 32; sb++) {
+        for (int h = 0; h < 2; h++) {
+            for (int r = 0; r < 8; r++) {
+                memcpy(out.qs + sb * 128 + h * 64 + r * 8, in[r].qs + sb * 16 + h * 8, 8);
+            }
+        }
+    }
+
+    return out;
+}
+
+static int repack_iq4_xs_to_iq4_xs_8_bl(struct ggml_tensor *       t,
+                                        int                        interleave_block,
+                                        const void * GGML_RESTRICT data,
+                                        size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_IQ4_XS);
+    GGML_ASSERT(interleave_block == 8);
+    constexpr int nrows_interleaved = 8;
+
+    block_iq4_xsx8 *     dst = (block_iq4_xsx8 *) t->data;
+    const block_iq4_xs * src = (const block_iq4_xs *) data;
+    block_iq4_xs         dst_tmp[8];
+    int                  nrow    = ggml_nrows(t);
+    int                  nblocks = t->ne[0] / QK_K;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_xs));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % 8 != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src[x + i * nblocks];
+            }
+            *dst++ = make_block_iq4_xsx8(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+}
+
 static block_iq2_xxsx8 make_block_iq2_xxsx8(block_iq2_xxs * in, unsigned int blck_size_interleave) {
     GGML_ASSERT(blck_size_interleave == 8);
     block_iq2_xxsx8 out;
@@ -5012,6 +5192,10 @@ template <> int repack<block_iq2_xxs, 8, 8>(struct ggml_tensor * t, const void *
     return repack_iq2_xxs_to_iq2_xxs_8_bl(t, 8, data, data_size);
 }
 
+template <> int repack<block_iq4_xs, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_iq4_xs_to_iq4_xs_8_bl(t, 8, data, data_size);
+}
+
 #if defined __riscv_zvfh
 template <> int repack<block_q4_0, 1, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_16_bl(t, 1, data, data_size);
@@ -5133,6 +5317,10 @@ template <> void gemv<block_iq2_xxs, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, siz
     ggml_gemv_iq2_xxs_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_iq4_xs, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_iq4_xs_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
+}
+
 #if defined __riscv_zvfh
 template <> void gemv<block_q4_0, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_16x1_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -5252,6 +5440,10 @@ template <> void gemm<block_iq1_s, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_
 
 template <> void gemm<block_iq2_xxs, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_iq2_xxs_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_iq4_xs, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_iq4_xs_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
 }
 
 #if defined __riscv_zvfh
@@ -5803,6 +5995,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for IQ2_XXS
     static const ggml::cpu::repack::tensor_traits<block_iq2_xxs, 8, 8, GGML_TYPE_Q8_K> iq2_xxs_8x8_q8_K;
 
+    // instance for IQ4_XS
+    static const ggml::cpu::repack::tensor_traits<block_iq4_xs, 8, 8, GGML_TYPE_Q8_K> iq4_xs_8x8_q8_K;
+
     // instances for RISC-V
     //
     // These implement outer-product style matrix multiplication kernels with
@@ -5986,6 +6181,12 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         if (ggml_cpu_has_avx512()) {
             if (cur->ne[1] % 8 == 0) {
                 return &iq2_xxs_8x8_q8_K;
+            }
+        }
+    } else if (cur->type == GGML_TYPE_IQ4_XS) {
+        if (ggml_cpu_has_avx512()) {
+            if (cur->ne[1] % 8 == 0) {
+                return &iq4_xs_8x8_q8_K;
             }
         }
     } else if (cur->type == GGML_TYPE_Q8_0) {
