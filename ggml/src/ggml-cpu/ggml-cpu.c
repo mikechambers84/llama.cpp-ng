@@ -1430,16 +1430,30 @@ UseGgmlGemm2:;
         nchunk1 = nr0 > nr1 ? 1 : nth_eff; // parallelize by src1 rows
     }
 
-    // The number of elements in each chunk
-    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-
     // for a matrix-vector product every chunk writes a small dense slice of dst, and an unaligned
     // chunk boundary makes adjacent threads write to the same cache line: with many threads the
     // resulting ping-pong right before the barrier can several-fold the cost of a small op.
     // snapping each boundary to a destination cache line keeps the lines private while the
     // chunk sizes stay balanced to within one line
-    const int64_t line_elems = nr1 == 1 ? 64 / MAX(1, (int64_t) ggml_type_size(dst->type)) : 1;
+    int64_t line_elems = nr1 == 1 ? 64 / MAX(1, (int64_t) ggml_type_size(dst->type)) : 1;
+
+    // with fewer rows than one destination line per chunk the snapping would collapse
+    // most chunks to empty ranges and serialize the op
+    if (nr0 < nchunk0 * line_elems) {
+        if (nb01 >= 16*1024) {
+            // few but long rows: the per-row work dwarfs the destination line
+            // ping-pong, so keep every thread busy on unsnapped rows
+            line_elems = 1;
+        } else {
+            // few short rows: keep the destination lines private and let the
+            // surplus threads idle at the barrier
+            nchunk0 = MAX((int64_t) 1, nr0 / line_elems);
+        }
+    }
+
+    // The number of elements in each chunk
+    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
