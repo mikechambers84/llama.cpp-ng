@@ -6164,8 +6164,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
 
-                    // row counts, per-expert row offsets and row mappings
-                    size += sizeof_mmid_row_mapping*ne02*(ne12 + 2);
+                    // row counts, per-expert row offsets, scheduling flag and
+                    // row mappings
+                    size += sizeof_mmid_row_mapping*(ne02*(ne12 + 2) + 1);
 
                     // per thread: a gemm output tile (see forward_mul_mat_id)
                     size += n_threads * MMID_GEMM_CHUNK * op->src[0]->ne[1] * sizeof(float);
@@ -6440,14 +6441,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const int64_t total_rows = (int64_t) n_ids * ne12;
 
-        // for prefill-sized batches, pad each expert's rows to a multiple of 4
-        // with zero rows so everything runs through the gemm, and assign whole
-        // experts to threads so the gemm runs at full output width; the column
-        // split keeps decode-sized batches on all threads
-        const bool expert_parallel = batch_groups && total_rows >= (int64_t) nth * 8;
-
-        // one quantized row per (expert, token) selection plus the group padding
-        const size_t nbw_rows = nbw1 * (total_rows + (expert_parallel ? 3 * n_as : 0));
+        // one quantized row per (expert, token) selection plus the worst-case
+        // group padding of the expert-parallel path
+        const size_t nbw_rows = nbw1 * (total_rows + (batch_groups ? 3 * n_as : 0));
 
         // distinct src1 rows staged for quantize-once, plus one shared zero row
         const size_t nbw_tokens = nbw1 * (ne11 * ne12 + 1);
@@ -6455,7 +6451,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(nbw_rows, sizeof(int64_t)) +
                  GGML_PAD(nbw_tokens, sizeof(int64_t)) +
-                 n_as*(ne12 + 2)*sizeof(mmid_row_mapping) +
+                 (n_as*(ne12 + 2) + 1)*sizeof(mmid_row_mapping) +
                  nth*MMID_GEMM_CHUNK*ne01*sizeof(float))
                 );
 
@@ -6466,9 +6462,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         auto * matrix_row_counts = (int64_t *) wdata_meta;          // [n_as]
         auto * matrix_row_offs   = matrix_row_counts + n_as;        // [n_as], offsets include the padding
-        struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_offs + n_as); // [n_as][ne12]
+        auto * mmid_flags        = matrix_row_offs + n_as;          // [1], expert_parallel decision
+        struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (mmid_flags + 1); // [n_as][ne12]
 
         float * tile_scratch = (float *) (matrix_rows + n_as * ne12) + ith * MMID_GEMM_CHUNK * ne01;
+
+        // decided by thread 0 during the mapping (needs the row counts) and
+        // read by everyone after the barrier
+        bool expert_parallel = false;
 
         auto padded_rows = [&](int64_t cnt) -> int64_t {
             return expert_parallel ? (cnt + 3) & ~(int64_t) 3 : cnt;
@@ -6493,6 +6494,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             }
 
+            // go expert-parallel (pad the groups, gemm at full output width,
+            // dynamic chunk units) only when there are enough units to balance
+            // the skewed expert loads across the threads; decode-sized batches
+            // stay on the column split
+            if (batch_groups) {
+                int64_t n_units = 0;
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    const int64_t cpad = (matrix_row_counts[cur_a] + 3) & ~(int64_t) 3;
+                    n_units += (cpad + MMID_GEMM_CHUNK - 1) / MMID_GEMM_CHUNK;
+                }
+                expert_parallel = n_units >= 2 * nth;
+            }
+            mmid_flags[0] = expert_parallel ? 1 : 0;
+
             int64_t off = 0;
             for (int cur_a = 0; cur_a < n_as; ++cur_a) {
                 matrix_row_offs[cur_a] = off;
@@ -6502,12 +6517,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             memset(zero_row, 0, nbw1);
 
             if (expert_parallel) {
-                // chunk counter hands out whole experts below
+                // chunk counter hands out the gemm-chunk units below
                 ggml_threadpool_chunk_set(params->threadpool, nth);
             }
         }
 
         ggml_barrier(params->threadpool);
+
+        expert_parallel = mmid_flags[0] != 0;
 
         if (expert_parallel) {
             // quantize each distinct src1 row once, then scatter; the extra
