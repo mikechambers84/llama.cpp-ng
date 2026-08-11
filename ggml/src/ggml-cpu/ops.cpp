@@ -8660,7 +8660,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         // VKQ32:  Q_TILE_SZ * DV (FP32 output accumulator)
         // V32:    KV_TILE_SZ * DV (F32 buffer for V tile)
         // K_f32:  KV_TILE_SZ * DK (F32 buffer for K tile — GEMM path)
-        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 2*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DV + KV_TILE_SZ*DV + KV_TILE_SZ*DK + CACHE_LINE_SIZE_F32);
+        // KQt:    KV_TILE_SZ * Q_TILE_SZ (KQ^T gemm output, transposed into KQ)
+        float * base  = (float *) params->wdata + ith*(Q_TILE_SZ*DK + 3*Q_TILE_SZ*KV_TILE_SZ + Q_TILE_SZ*DV + KV_TILE_SZ*DV + KV_TILE_SZ*DK + CACHE_LINE_SIZE_F32);
 
         void  * Q_q    = base;
         float * KQ     = (float *)((char *)base + Q_TILE_SZ * DK * sizeof(float));
@@ -8668,6 +8669,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         float * VKQ32  = mask32 + Q_TILE_SZ * KV_TILE_SZ;
         float * V32    = VKQ32 + Q_TILE_SZ * DV;
         float * K_f32  = V32 + KV_TILE_SZ * DV;
+        float * KQt    = K_f32 + KV_TILE_SZ * DK;
 
         memset(VKQ32, 0, Q_TILE_SZ * DV * sizeof(float));
         memset(mask32, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
@@ -8681,13 +8683,20 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         const int iv2 = iq2 / rv2;
 
         {
-            float * Q_f32 = (float *)Q_q;
+            // Q is packed transposed (Q^T: [DK][Q_TILE]) so the KQ gemm can consume
+            // K rows directly - transposing Q once per q-tile replaces transposing
+            // every K tile on every pass over KV
+            float * Q_t = (float *)Q_q;
             for (int tq = 0; tq < tile_rows; tq++) {
                 const float * pq = (const float *) ((char *) q->data + ((iq1 + tq)*nbq1 + iq2*nbq2 + iq3*nbq3));
-                memcpy(Q_f32 + tq * DK, pq, DK * sizeof(float));
+                for (int64_t dk = 0; dk < DK; dk++) {
+                    Q_t[dk * Q_TILE_SZ + tq] = pq[dk];
+                }
             }
             for (int tq = tile_rows; tq < Q_TILE_SZ; tq++) {
-                memset(Q_f32 + tq * DK, 0, DK * sizeof(float));
+                for (int64_t dk = 0; dk < DK; dk++) {
+                    Q_t[dk * Q_TILE_SZ + tq] = 0.0f;
+                }
             }
         }
 
@@ -8702,15 +8711,17 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
-                        }
+                    float * m_row = mask32 + tq * KV_TILE_SZ;
+                    ggml_cpu_fp16_to_fp32(mp_row + ic, m_row, kv_tile);
+                    if (slope != 1.0f) {
+                        ggml_vec_scale_f32(kv_tile, m_row, slope);
+                    }
+                    for (int tk = 0; tk < kv_tile && can_skip; tk++) {
+                        can_skip = m_row[tk] == -INFINITY;
                     }
                     // Pad remaining mask entries with -inf
                     for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
+                        m_row[tk] = -INFINITY;
                     }
                 }
 
@@ -8719,25 +8730,27 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 }
             }
 
-            // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
-            // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
+            // Pack K tile row-major in F32 (vectorized convert, no transpose).
+            // Stale values may remain in the padded rows - the padded KQ
+            // entries are overwritten with -inf below.
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
                 if (kv_type == GGML_TYPE_F16) {
-                    const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
-                    for (int64_t dk = 0; dk < DK; dk++) {
-                        K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
-                    }
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)k_data, K_f32 + tk * DK, DK);
                 } else {
-                    const float * k_f32_src = (const float *)k_data;
-                    for (int64_t dk = 0; dk < DK; dk++) {
-                        K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
-                    }
+                    memcpy(K_f32 + tk * DK, k_data, DK * sizeof(float));
                 }
             }
-            memset(KQ, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
-            simd_gemm(KQ, (const float *)Q_q, K_f32, Q_TILE_SZ, DK, KV_TILE_SZ);
-            ggml_vec_scale_f32(Q_TILE_SZ * KV_TILE_SZ, KQ, scale);
+            // KQ^T = K x Q^T, transposed back with the scale folded in. The
+            // dk-accumulation order matches the previous Q x K^T formulation,
+            // so the KQ values are bit-identical.
+            memset(KQt, 0, KV_TILE_SZ * Q_TILE_SZ * sizeof(float));
+            simd_gemm(KQt, K_f32, (const float *)Q_q, KV_TILE_SZ, DK, Q_TILE_SZ);
+            for (int tq = 0; tq < Q_TILE_SZ; tq++) {
+                for (int tk = 0; tk < KV_TILE_SZ; tk++) {
+                    KQ[tq * KV_TILE_SZ + tk] = KQt[tk * Q_TILE_SZ + tq] * scale;
+                }
+            }
 
             // Set padded KQ entries to -inf so softmax gives them zero weight
             if (kv_tile < KV_TILE_SZ) {
@@ -8789,7 +8802,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
                 if (kv_type == GGML_TYPE_F16) {
-                    ggml_fp16_to_fp32_row((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
                 } else {
                     memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
                 }
@@ -8839,6 +8852,224 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     }
 }
 
+// Split-KV decode kernel (neq1 == 1): one KV chunk per thread, and all q heads
+// of a KV-head group share a single walk over the chunk so each K/V row is
+// pulled from memory once instead of once per q head. KV rows are consumed in
+// tiles of GGML_FA_TILE_KV so the softmax runs batched (ggml_vec_soft_max_f32)
+// with one accumulator rescale per tile, V rows are converted to F32 once and
+// shared across the group, and the VKQ accumulator stays in F32 throughout.
+// Writes per-head [M, S, VKQ] partials for ggml_flash_attn_ext_reduce_partials.
+static void ggml_compute_forward_flash_attn_ext_f16_decode_chunk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int64_t ic_start, int64_t ic_end,
+        float * partials, int64_t partial_stride) {
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q, nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k, nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+
+    static constexpr int KV_TILE = GGML_FA_TILE_KV;
+
+    // q heads per kv head
+    const int64_t rk2 = neq2/nek2;
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
+    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+
+    GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
+    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
+
+    const int ith = params->ith;
+
+    const int64_t scratch_size = GGML_FA_DECODE_SCRATCH_F32(neq2, DK, DV) + CACHE_LINE_SIZE_F32;
+
+    // layout must match GGML_FA_DECODE_SCRATCH_F32
+    float * base   = (float *) params->wdata + ith*scratch_size;
+    char  * Q_q    = (char  *) base;                 // neq2 q rows in k's vec-dot type
+    float * scores = base   + neq2*DK;               // [group head][KV_TILE]
+    float * VKQ32  = scores + neq2*KV_TILE;          // [group head][DV] F32 accumulators
+    float * Ms     = VKQ32  + neq2*DV;               // running max per group head
+    float * Ss     = Ms     + neq2;                  // running sum per group head
+    float * V32    = Ss     + neq2;                  // one V row in F32
+    float * mask32 = V32    + DV;                    // one mask tile in F32
+
+    const size_t qq_row = ggml_row_size(k_vec_dot_type, DK);
+    for (int64_t h = 0; h < neq2; h++) {
+        const float * pq = (const float *) ((const char *) q->data + h*nbq2);
+        q_to_vec_dot(pq, (void *) (Q_q + h*qq_row), DK);
+    }
+
+    // decode masks are normally shared by all heads; a per-head mask forces
+    // the conversion into the per-head loop
+    const int64_t mne2        = mask ? mask->ne[2] : 1;
+    const bool    mask_shared = mask && mne2 == 1;
+
+    for (int64_t ikh = 0; ikh < nek2; ikh++) {
+        const int64_t h0 = ikh*rk2;
+
+        for (int64_t g = 0; g < rk2; g++) {
+            Ms[g] = -INFINITY;
+            Ss[g] = 0.0f;
+            memset(VKQ32 + g*DV, 0, DV*sizeof(float));
+        }
+
+        for (int64_t ic = ic_start; ic < ic_end; ic += KV_TILE) {
+            const int tile = (int) MIN((int64_t) KV_TILE, ic_end - ic);
+
+            if (mask_shared) {
+                const ggml_fp16_t * mp = (const ggml_fp16_t *) mask->data;
+                ggml_cpu_fp16_to_fp32(mp + ic, mask32, tile);
+                bool all_masked = true;
+                for (int t = 0; t < tile && all_masked; t++) {
+                    all_masked = mask32[t] == -INFINITY;
+                }
+                if (all_masked) {
+                    continue;
+                }
+            }
+
+            for (int64_t g = 0; g < rk2; g++) {
+                const int64_t h = h0 + g;
+                float * row = scores + g*KV_TILE;
+
+                const char * qptr = Q_q + h*qq_row;
+                for (int t = 0; t < tile; t++) {
+                    float s;
+                    kq_vec_dot(DK, &s, 0, (const char *) k->data + (ic + t)*nbk1 + ikh*nbk2, 0, qptr, 0, 1);
+                    row[t] = s*scale;
+                }
+
+                if (logit_softcap != 0.0f) {
+                    ggml_vec_tanh_f32(tile, row, row);
+                    ggml_vec_scale_f32(tile, row, logit_softcap);
+                }
+
+                if (mask) {
+                    if (!mask_shared) {
+                        const ggml_fp16_t * mp = (const ggml_fp16_t *) ((const char *) mask->data + (h % mne2)*mask->nb[2]);
+                        ggml_cpu_fp16_to_fp32(mp + ic, mask32, tile);
+                    }
+                    const float slope = (max_bias > 0.0f) ? (h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1)) : 1.0f;
+                    ggml_vec_mad_f32(tile, row, mask32, slope);
+                }
+
+                for (int t = tile; t < KV_TILE; t++) {
+                    row[t] = -INFINITY;
+                }
+
+                // online softmax, one rescale per tile
+                float tmax;
+                ggml_vec_max_f32(KV_TILE, &tmax, row);
+                if (tmax == -INFINITY) {
+                    // every position in this tile is masked for this head:
+                    // zero the weights so the V accumulation is a no-op
+                    memset(row, 0, KV_TILE*sizeof(float));
+                    continue;
+                }
+
+                const float Mold = Ms[g];
+                const float Mnew = MAX(Mold, tmax);
+                if (Mnew > Mold) {
+                    const float ms = expf(Mold - Mnew);
+                    ggml_vec_scale_f32(DV, VKQ32 + g*DV, ms);
+                    Ss[g] *= ms;
+                    Ms[g]  = Mnew;
+                }
+
+                Ss[g] += ggml_vec_soft_max_f32(KV_TILE, row, row, Ms[g]);
+            }
+
+            // V accumulation: each row converted once, consumed by the whole group
+            for (int t = 0; t < tile; t++) {
+                const char  * v_data = (const char *) v->data + (ic + t)*nbv1 + ikh*nbv2;
+                const float * vp;
+                if (v->type == GGML_TYPE_F16) {
+                    // the generic to_float for F16 is a scalar loop
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, V32, DV);
+                    vp = V32;
+                } else if (v_to_float) {
+                    v_to_float(v_data, V32, DV);
+                    vp = V32;
+                } else {
+                    // V is F32
+                    vp = (const float *) v_data;
+                }
+                for (int64_t g = 0; g < rk2; g++) {
+                    const float vs = scores[g*KV_TILE + t];
+                    if (vs != 0.0f) {
+                        ggml_vec_mad_f32(DV, VKQ32 + g*DV, vp, vs);
+                    }
+                }
+            }
+        }
+
+        // sinks - apply only on the first kv-chunk
+        if (sinks && ic_start == 0) {
+            for (int64_t g = 0; g < rk2; g++) {
+                const float s = ((float *) ((char *) sinks->data))[h0 + g];
+
+                float ms = 1.0f;
+                float vs = 1.0f;
+
+                if (s > Ms[g]) {
+                    ms = expf(Ms[g] - s);
+                    Ms[g] = s;
+                    ggml_vec_scale_f32(DV, VKQ32 + g*DV, ms);
+                } else {
+                    vs = expf(s - Ms[g]);
+                }
+
+                Ss[g] = Ss[g]*ms + vs;
+            }
+        }
+
+        for (int64_t g = 0; g < rk2; g++) {
+            // partials layout: [M, S, VKQ[DV]] per query head
+            float * partial = partials + (h0 + g)*partial_stride;
+            partial[0] = Ms[g];
+            partial[1] = Ss[g];
+            memcpy(partial + 2, VKQ32 + g*DV, DV*sizeof(float));
+        }
+    }
+
+    GGML_UNUSED(nbq0);
+    GGML_UNUSED(nbk0);
+    GGML_UNUSED(nbv0);
+}
+
 // Reduction function: combines partial results across KV chunks
 // Partials layout in wdata: [n_q_heads][n_chunks][2 + DV]
 static void ggml_flash_attn_ext_reduce_partials(
@@ -8859,10 +9090,10 @@ static void ggml_flash_attn_ext_reduce_partials(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int64_t wdata_per_thread = DK + 2*DV + CACHE_LINE_SIZE_F32;
+    const int64_t wdata_per_thread = GGML_FA_DECODE_SCRATCH_F32(n_q_heads, DK, DV) + CACHE_LINE_SIZE_F32;
     float *       thread_wdata     = (float *) params->wdata + ith * wdata_per_thread;
 
-    const int64_t partials_offset  = nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+    const int64_t partials_offset  = nth * wdata_per_thread;
     const int64_t partial_size     = 2 + DV;
     const float * partials_base    = (const float *) params->wdata + partials_offset;
 
@@ -8967,7 +9198,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
-        float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        const int64_t scratch_size  = GGML_FA_DECODE_SCRATCH_F32(neq2, DK, DV) + CACHE_LINE_SIZE_F32;
+        float *       partials_base = (float *) params->wdata + nth * scratch_size;
 
         const int64_t ic_start = ith * chunk_size;
         const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
@@ -8976,11 +9208,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         float *       chunk_partials = partials_base + ith * partial_size;
 
         if (ic_start < nek1) {
-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
-                    chunk_partials, partial_stride);
-            }
+            ggml_compute_forward_flash_attn_ext_f16_decode_chunk(
+                params, dst, ic_start, ic_end,
+                chunk_partials, partial_stride);
         } else {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 float * q_partials = chunk_partials + q_head * partial_stride;

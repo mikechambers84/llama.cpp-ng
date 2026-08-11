@@ -9,6 +9,13 @@
 #define GGML_FA_TILE_Q  64
 #define GGML_FA_TILE_KV 64
 
+// Per-thread scratch (in floats, excluding cache-line padding) for the split-KV
+// flash-attention decode path: converted Q for all heads, one score tile per
+// head, F32 VKQ accumulators, running max/sum per head, one converted V row and
+// a converted mask tile.
+#define GGML_FA_DECODE_SCRATCH_F32(n_head, DK, DV) \
+    ((n_head)*((DK) + GGML_FA_TILE_KV + (DV) + 2) + (DV) + GGML_FA_TILE_KV)
+
 #ifdef __cplusplus
 
 #include <utility>

@@ -2999,13 +2999,15 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t DV = node->src[2]->ne[0];
 
                         // Tiled flash attention scratch (tile sizes defined in common.h)
-                        // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
-                        size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
+                        // Per-thread: Q_q + KQ + mask + KQt + VKQ32 + V32 + K_f32 + padding
+                        size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 3*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
 
                         // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+                        // Per-thread: per-head [M, S, VKQ] partials for every chunk plus the
+                        // decode kernel scratch (+ 64 floats for the cache-line padding the
+                        // kernel adds; CACHE_LINE_SIZE_F32 is at most 64)
                         size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(GGML_FA_DECODE_SCRATCH_F32(neq2, DK, DV) + 64));
 
                         cur += MAX(prefill, decode);
                     } break;
