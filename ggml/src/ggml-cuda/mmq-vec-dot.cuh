@@ -919,12 +919,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_K, I);
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + txs.qs;
-    const int   * x_sc = (const int   *) x_dm + txs.dm;
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
 // #pragma unroll
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_K*VDR_Q4_K_Q8_1_MMQ) {
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 2*QI8_1) { // 64 values per step: low+high nibbles of 8 ints
         const int k0 = k00 + k01;
 
 #pragma unroll
@@ -935,11 +934,24 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                const uint8_t * sc = (const uint8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k0/32] + 2*(k01/16);
+                int sumi_lo = 0;
+                int sumi_hi = 0;
+#pragma unroll
+                for (int l = 0; l < QI8_1; ++l) {
+                    const int v = x_qs[i*(MMQ_TILE_NE_K + 1) + k0/2 + l];
+                    sumi_lo = ggml_cuda_dp4a((v >> 0) & 0x0F0F0F0F, y_qs[j*MMQ_TILE_Y_K + k01         + l], sumi_lo);
+                    sumi_hi = ggml_cuda_dp4a((v >> 4) & 0x0F0F0F0F, y_qs[j*MMQ_TILE_Y_K + k01 + QI8_1 + l], sumi_hi);
+                }
 
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_K_q8_1_impl_mmq(
-                    &x_qs[i*(MMQ_TILE_NE_K + 1) + k0/2], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
-                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                const float2 dm_lo = __half22float2(x_dm[i*(MMQ_TILE_NE_K/4 + 1) + k0/QI8_1 + 0]);
+                const float2 dm_hi = __half22float2(x_dm[i*(MMQ_TILE_NE_K/4 + 1) + k0/QI8_1 + 1]);
+                const float2 ds_lo = __half22float2(y_ds[j*MMQ_TILE_Y_K + (k01        )/QI8_1]);
+                const float2 ds_hi = __half22float2(y_ds[j*MMQ_TILE_Y_K + (k01 + QI8_1)/QI8_1]);
+
+                // dm.y is stored pre-negated: value = d*sc*q - dmin*m
+                sum[j0/nwarps*I/warp_size + i0/warp_size] +=
+                    dm_lo.x*ds_lo.x*sumi_lo + dm_lo.y*ds_lo.y +
+                    dm_hi.x*ds_hi.x*sumi_hi + dm_hi.y*ds_hi.y;
             }
         }
     }
