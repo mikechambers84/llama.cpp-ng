@@ -91,6 +91,8 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_IQ1_S:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
+        case GGML_TYPE_IQ1_M:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -187,6 +189,10 @@ struct ggml_cuda_mmq_config {
 
     // TODO transition all combinations of GPUs and quantizations to the MMA data layout.
     __host__ int use_mma_data_layout(const int cc) const {
+        // The per-8 delta term of IQ1_M has a dp4a vec_dot only for now.
+        if (type == GGML_TYPE_IQ1_M) {
+            return false;
+        }
         if (amd_mfma_available(cc) || amd_wmma_available(cc) || turing_mma_available(cc)) {
             return true;
         }
@@ -194,6 +200,9 @@ struct ggml_cuda_mmq_config {
     }
 
     constexpr __device__ bool use_mma_data_layout() const {
+        if (type == GGML_TYPE_IQ1_M) {
+            return false;
+        }
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
         return true;
 #else
@@ -383,6 +392,7 @@ static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, 
 #define MMQ_DP4A_TXS_Q8_0    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*2/QI8_0 + I/(QI8_0/2), 0}
 #define MMQ_DP4A_TXS_Q8_0_16 tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*4/QI8_0 + I/(QI8_0/4), 0}
 #define MMQ_DP4A_TXS_Q8_1    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*2/QI8_1 + I/(QI8_1/2), 0}
+#define MMQ_DP4A_TXS_IQ1_M   tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K         + I,           0}
 #define MMQ_DP4A_TXS_Q2_K    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K         + I,           0}
 #define MMQ_DP4A_TXS_Q3_K    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I,                                     I*MMQ_TILE_NE_K/8 + I/8}
 #define MMQ_DP4A_TXS_Q4_K    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_K,                 I*MMQ_TILE_NE_K/8 + I/8}
@@ -411,6 +421,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ3_XXS: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ3_S:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ1_S:   return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_IQ1_M:   return MMQ_DP4A_TXS_IQ1_M;
         case GGML_TYPE_IQ4_XS:  return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
@@ -623,6 +634,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     VDR_IQ1_S_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_iq1_s<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_IQ1_M:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_IQ1_M_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_iq1_m<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_iq1_m_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
             case GGML_TYPE_IQ2_XXS:
                 return ggml_cuda_mmq_util_funcs(
@@ -1584,6 +1601,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
+extern DECL_MMQ_CASE(GGML_TYPE_IQ1_M);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
