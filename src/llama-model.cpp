@@ -445,7 +445,42 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    static const std::regex pattern_dsv4_q_b  ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_dsv4_out_a("blk\\.\\d*\\.attn_output_a\\.weight");
+    static const std::regex pattern_dsv4_out_b("blk\\.\\d*\\.attn_output_b\\.weight");
+
     auto get_tensor_config = [&]() -> tensor_config {
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+            // DeepSeek V4 attention is MQA (a single KV head shared by all Q heads) with a
+            // grouped output projection, so the attention path is split by output groups:
+            // each device holds a share of the groups and the full mirrored KV path.
+            if (std::regex_match(tensor_name, pattern_dsv4_q_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+            if (std::regex_match(tensor_name, pattern_dsv4_out_a)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_dsv4_out_b)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            // the MoE experts and the output head split like any other model:
+            if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_exps.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_exps.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_output_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
+            // everything else (the shared KV path, compressors, indexer, hyper-connections,
+            // shared expert, all caches and MTP tensors) is mirrored:
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -527,6 +562,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+            // no segmented tensors; in particular ffn_up_exps must not trip the fused up + gate heuristic below
+            return {{tensor->ne[axis], 1}};
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
@@ -597,6 +636,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+            // the grouped output projection mixes the heads within an output group,
+            // so the attention path must be split at output group boundaries
+            const int64_t n_heads_group = hparams.n_head(il) / hparams.dsv4_o_group_count;
+            const int64_t o_group_dim   = n_heads_group * hparams.n_embd_head_k(il);
+            if (std::regex_match(tensor_name, pattern_dsv4_q_b)) {
+                return {std::lcm(o_group_dim, blck_size)};
+            }
+            if (std::regex_match(tensor_name, pattern_dsv4_out_a)) {
+                return {1}; // split along the group dim
+            }
+            if (std::regex_match(tensor_name, pattern_dsv4_out_b)) {
+                return {std::lcm((int64_t) hparams.dsv4_o_lora_rank, blck_size)};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return {n_heads_group};
+            }
+            // the MoE experts and the output head use the generic granularities below
+        }
+
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
