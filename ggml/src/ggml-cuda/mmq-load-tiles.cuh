@@ -903,23 +903,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 #else
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
-        int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
-
-        if (fallback) {
-            i = min(i, i_max);
-        }
-
-        const block_q5_K * bxi = (const block_q5_K *) x + kbx0 + i*stride;
-
-        x_dm[i] = bxi->dm;
-    }
-
-    constexpr int rows_per_warp = warp_size / 4;
+    // Decode the packed 6-bit scales/mins at load time into one half2
+    // (d*sc, -dmin*m) per 32-value sub-block, same as the q4_K dp4a path.
+    constexpr int rows_per_warp = warp_size / 2;
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
-        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
+        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
 
         if (fallback) {
             i = min(i, i_max);
@@ -928,12 +917,22 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_q5_K * bxi = (const block_q5_K *) x + kbx0 + i*stride;
 
         const int * scales = (const int *) bxi->scales;
+        const int ksc = threadIdx.x % 2;
 
-        const int ksc = threadIdx.x % (MMQ_TILE_NE_K/8);
-        const int scales8 = unpack_scales_q45_K(scales, ksc);
+        const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
+        const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
 
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = scales8;
+        const uint8_t * sc8 = (const uint8_t *) &sc32;
+        const uint8_t *  m8 = (const uint8_t *)  &m32;
+
+        const float2 dmf = __half22float2(bxi->dm);
+
+#pragma unroll
+        for (int l = 0; l < (int) sizeof(int); ++l) {
+            x_dm[i*(MMQ_TILE_NE_K/4 + 1) + (int) sizeof(int)*ksc + l] = make_half2(dmf.x*sc8[l], -dmf.y*m8[l]);
+        }
     }
+    GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
@@ -1001,8 +1000,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride]                     = bxi->d;
-#else
-        x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K] = bxi->d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
@@ -1020,7 +1017,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_sc[i*sram_stride + threadIdx.x%4] = get_int_b2(bxi->scales, threadIdx.x % (MMQ_TILE_NE_K/8));
 #else
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + threadIdx.x%(MMQ_TILE_NE_K/8)] = get_int_b2(bxi->scales, threadIdx.x%(QI6_K/8));
+        // Decode the int8 sub-scales at load time into one float (d*sc) per
+        // 16-value group so the vec_dot reads clean floats.
+        const int     ksc     = threadIdx.x % (MMQ_TILE_NE_K/8);
+        const int     sc32    = get_int_b2(bxi->scales, ksc);
+        const int8_t * sc8    = (const int8_t *) &sc32;
+        const float   d       = bxi->d;
+
+#pragma unroll
+        for (int l = 0; l < (int) sizeof(int); ++l) {
+            x_df[i*(MMQ_TILE_NE_K/2 + 1) + (int) sizeof(int)*ksc + l] = d*sc8[l];
+        }
+        GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
