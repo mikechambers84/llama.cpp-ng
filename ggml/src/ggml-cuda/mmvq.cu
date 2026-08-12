@@ -427,6 +427,30 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return 1;
     }
+    if (table_id == MMVQ_PARAMETERS_RDNA2) {
+        // RDNA2 (V620/gfx1030): nwarps=2 for types with simple vec_dot at ncols_dst=1.
+        // Higher warp counts regress MoE expert matvecs (short K per warp, reduction
+        // overhead dominates); complex vec_dot types kept at 1 like RDNA3/RDNA4.
+        if (ncols_dst == 1) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return 2;
+                default:
+                    return 1;
+            }
+        }
+        return 1;
+    }
     if (table_id == MMVQ_PARAMETERS_TURING) {
         if (ncols_dst == 1) {
             switch (type) {
