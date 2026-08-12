@@ -661,33 +661,25 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const int sc = __vsubss4(sc_low | sc_high, 0x20202020);
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         const int8_t * sc8 = (const int8_t *) &sc;
         const float d = bxi->d;
 
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #pragma unroll
         for (int l = 0; l < int(sizeof(int)); ++l) {
             x_df[i*sram_stride + sizeof(int)*ksc + l] = d*sc8[l];
         }
 #else
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = sc;
+        // Decode the sub-scales at load time into one float (d*sc) per
+        // 16-value group, like the MMA branch, so the vec_dot reads clean
+        // floats instead of doing byte-granular scale extraction per dot.
+#pragma unroll
+        for (int l = 0; l < int(sizeof(int)); ++l) {
+            x_df[i*(MMQ_TILE_NE_K/2 + 1) + int(sizeof(int))*ksc + l] = d*sc8[l];
+        }
+        GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
-
-#if !(defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
-        int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
-
-        if (fallback) {
-            i = min(i, i_max);
-        }
-
-        const block_q3_K * bxi = (const block_q3_K *) x + kbx0 + i*stride;
-
-        x_df[i] = bxi->d;
-    }
-#endif // !(defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)) || defined(AMD_WMMA_AVAILABLE)
 }
 
 static __device__ __forceinline__ int unpack_scales_q45_K(const int * scales, const int ksc) {
