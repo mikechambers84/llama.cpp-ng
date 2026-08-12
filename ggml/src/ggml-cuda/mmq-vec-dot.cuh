@@ -1012,12 +1012,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q5_K, I);
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + txs.qs;
-    const int   * x_sc = (const int   *) x_dm + txs.dm;
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
 // #pragma unroll
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR5_K*VDR_Q5_K_Q8_1_MMQ) {
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) { // 32 values per step, already unpacked to bytes
         const int k0 = k00 + k01;
 
 #pragma unroll
@@ -1028,11 +1027,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                const uint8_t * sc = ((const uint8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k00/32]) + 2*(k01/16);
+                int sumi = 0;
+#pragma unroll
+                for (int l = 0; l < QI8_1; ++l) {
+                    sumi = ggml_cuda_dp4a(x_qs[i*(QR5_K*MMQ_TILE_NE_K + 1) + k0 + l], y_qs[j*MMQ_TILE_Y_K + k01 + l], sumi);
+                }
 
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q5_K_q8_1_impl_mmq(
-                    &x_qs[i*(QR5_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
-                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                const float2 dm = __half22float2(x_dm[i*(MMQ_TILE_NE_K/4 + 1) + k0/QI8_1]);
+                const float2 ds = __half22float2(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+
+                // dm.y is stored pre-negated: value = d*sc*q - dmin*m
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += dm.x*ds.x*sumi + dm.y*ds.y;
             }
         }
     }
@@ -1047,12 +1052,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q6_K, I);
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
-    const int   * x_sc = (const int   *) x_df + txs.dm;
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
 // #pragma unroll
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR6_K*VDR_Q6_K_Q8_1_MMQ) {
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) { // 32 values per step: two 16-value scale groups
         const int k0 = k00 + k01;
 
 #pragma unroll
@@ -1063,11 +1067,21 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                const int8_t * sc = ((const int8_t *) &x_sc[i * (MMQ_TILE_NE_K/8) + i/8 + k0/16]);
+                int sumi_a = 0;
+                int sumi_b = 0;
+#pragma unroll
+                for (int l = 0; l < QI8_1/2; ++l) {
+                    sumi_a = ggml_cuda_dp4a(x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0           + l],
+                                            y_qs[j*MMQ_TILE_Y_K + k01           + l], sumi_a);
+                    sumi_b = ggml_cuda_dp4a(x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0 + QI8_1/2 + l],
+                                            y_qs[j*MMQ_TILE_Y_K + k01 + QI8_1/2 + l], sumi_b);
+                }
 
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q6_K_q8_1_impl_mmq(
-                    &x_qs[i*(QR6_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc,
-                    x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K], &y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                const float dsa = x_df[i*(MMQ_TILE_NE_K/2 + 1) + k0/(QI8_1/2) + 0];
+                const float dsb = x_df[i*(MMQ_TILE_NE_K/2 + 1) + k0/(QI8_1/2) + 1];
+                const float dy  = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += dy*(dsa*sumi_a + dsb*sumi_b);
             }
         }
     }
