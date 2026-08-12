@@ -477,6 +477,52 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// Used for IQ1_M: per-16 sub-scales with a per-8 signed delta term. The delta
+// contribution uses activation sums computed inline with dp4a against ones,
+// hoisted per (column, k-group) so the cost amortizes over the row loop.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_iq1_m_q8_1_dp4a(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_M, I);
+    const int   * x_qs = (const int   *) x;
+    const half2 * x_ds = (const half2 *) (x_qs + txs.qs);
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+// #pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 2) { // 8 values per step
+        const int k0 = k00 + k01;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            const int y0 = y_qs[j*MMQ_TILE_Y_K + k01 + 0];
+            const int y1 = y_qs[j*MMQ_TILE_Y_K + k01 + 1];
+
+            int sumy = ggml_cuda_dp4a(y0, 0x01010101, 0);
+            sumy     = ggml_cuda_dp4a(y1, 0x01010101, sumy);
+
+            const float dy = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int i0 = 0; i0 < I; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+
+                int sumi = ggml_cuda_dp4a(x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 0], y0, 0);
+                sumi     = ggml_cuda_dp4a(x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 1], y1, sumi);
+
+                const float2 ds8 = __half22float2(x_ds[i*(MMQ_TILE_NE_K + 1) + k0/2]);
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += dy * (ds8.x*sumi + ds8.y*sumy);
+            }
+        }
+    }
+}
+
 // Used for Q3_K, IQ2_S, and IQ2_XS:
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
