@@ -778,9 +778,14 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 #else
+    // Decode the packed 6-bit scales/mins once at load time into one
+    // half2 (d*sc, -dmin*m) per 32-value sub-block, like the MMA branch:
+    // the dp4a vec_dot then reads clean half2 pairs instead of doing
+    // byte-granular scale extraction per dot.
+    constexpr int rows_per_warp = warp_size / 2;
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
-        int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
+    for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
 
         if (fallback) {
             i = min(i, i_max);
@@ -788,26 +793,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
 
-        x_dm[i] = bxi->dm;
-    }
-    constexpr int rows_per_warp = warp_size / 4;
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
-        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
-
-        if (fallback) {
-            i = min(i, i_max);
-        }
-
-        const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride + (threadIdx.x % (MMQ_TILE_NE_K/8)) / (QI4_K/8);
-
         const int * scales = (const int *) bxi->scales;
+        const int ksc = threadIdx.x % 2;
 
-        const int ksc = threadIdx.x % (MMQ_TILE_NE_K/8);
-        const int scales8 = unpack_scales_q45_K(scales, ksc);
+        const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
+        const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
 
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = scales8;
+        const uint8_t * sc8 = (const uint8_t *) &sc32;
+        const uint8_t *  m8 = (const uint8_t *)  &m32;
+
+        const float2 dmf = __half22float2(bxi->dm);
+
+#pragma unroll
+        for (int l = 0; l < (int) sizeof(int); ++l) {
+            x_dm[i*(MMQ_TILE_NE_K/4 + 1) + (int) sizeof(int)*ksc + l] = make_half2(dmf.x*sc8[l], -dmf.y*m8[l]);
+        }
     }
+    GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
