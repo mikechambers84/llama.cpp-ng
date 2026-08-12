@@ -625,54 +625,53 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_ds = (const half2 *) y;
 
-    float2 y_df[J/nwarps];
-#pragma unroll
-    for (int j0 = 0; j0 < J; j0 += nwarps) {
-        const int j = j0 + threadIdx.y;
-
-        y_df[j0/nwarps] = __half22float2(y_ds[j*MMQ_TILE_Y_K]);
-    }
-
-#pragma unroll
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K/2; k01 += QR2_K*VDR_Q2_K_Q8_1_MMQ) {
+// #pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) { // 32 values per step: two 16-value scale groups
         const int k0 = k00 + k01;
 
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
 
-#pragma unroll
-            for (int i0 = 0; i0 < I; i0 += warp_size) {
-                const int i = i0 + threadIdx.x;
-
-                constexpr int ns = 2;
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q2_K_q8_1_impl_mmq<ns>(
-                    &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
-                    &x_dm[i*(MMQ_TILE_NE_K + 1) + k0/4], k01 < MMQ_TILE_NE_K/2 ? y_df[j0/nwarps].x : y_df[j0/nwarps].y,
-                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]);
-            }
-        }
-    }
-
-    // Some compilers fail to unroll the loop over k01 if there is a conditional statement for ns in the inner loop.
-    // As a workaround 2 separate loops are used instead.
-#pragma unroll
-    for (int k01 = MMQ_TILE_NE_K/2; k01 < MMQ_TILE_NE_K; k01 += QR2_K*VDR_Q2_K_Q8_1_MMQ) {
-        const int k0 = k00 + k01;
-
-#pragma unroll
-        for (int j0 = 0; j0 < J; j0 += nwarps) {
-            const int j = j0 + threadIdx.y;
+            const float2 dy = __half22float2(y_ds[j*MMQ_TILE_Y_K]);
+            const float  d8 = k01 < MMQ_TILE_NE_K/2 ? dy.x : dy.y;
 
 #pragma unroll
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
-                constexpr int ns = 1;
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q2_K_q8_1_impl_mmq<ns>(
-                    &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
-                    &x_dm[i*(MMQ_TILE_NE_K + 1) + k0/4], k01 < MMQ_TILE_NE_K/2 ? y_df[j0/nwarps].x : y_df[j0/nwarps].y,
-                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]);
+                int sumi_a = 0;
+                int sumi_b = 0;
+#pragma unroll
+                for (int l = 0; l < QI8_1/2; ++l) {
+                    sumi_a = ggml_cuda_dp4a(x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0           + l],
+                                            y_qs[j*MMQ_TILE_Y_K + k01           + l], sumi_a);
+                    sumi_b = ggml_cuda_dp4a(x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + QI8_1/2 + l],
+                                            y_qs[j*MMQ_TILE_Y_K + k01 + QI8_1/2 + l], sumi_b);
+                }
+
+                const float2 dm_a = __half22float2(x_dm[i*(MMQ_TILE_NE_K + 1) + k0/(QI8_1/2) + 0]);
+                const float2 dm_b = __half22float2(x_dm[i*(MMQ_TILE_NE_K + 1) + k0/(QI8_1/2) + 1]);
+
+                float partial = d8*(dm_a.x*sumi_a + dm_b.x*sumi_b);
+
+                if (k01 < 3*MMQ_TILE_NE_K/4) {
+                    // partial sums of the activations per 16 values are stored in the y tile
+                    const float2 s8f = __half22float2(y_ds[j*MMQ_TILE_Y_K + 1 + k01/QI8_1]);
+                    partial -= dm_a.y*s8f.x + dm_b.y*s8f.y;
+                } else {
+                    // last 32 values: no stored partial sums, compute them inline
+                    int sumy_a = 0;
+                    int sumy_b = 0;
+#pragma unroll
+                    for (int l = 0; l < QI8_1/2; ++l) {
+                        sumy_a = ggml_cuda_dp4a(0x01010101, y_qs[j*MMQ_TILE_Y_K + k01           + l], sumy_a);
+                        sumy_b = ggml_cuda_dp4a(0x01010101, y_qs[j*MMQ_TILE_Y_K + k01 + QI8_1/2 + l], sumy_b);
+                    }
+                    partial -= d8*(dm_a.y*sumy_a + dm_b.y*sumy_b);
+                }
+
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += partial;
             }
         }
     }
