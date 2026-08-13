@@ -800,6 +800,27 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (n_copies == 1 || (stride_tensor == size && stride_data == size)) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size*n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        return;
+    }
+    if (stride_tensor == size) {
+        // Strided host reads into a contiguous device range, e.g. uploading one device's slice
+        // of a split model tensor. A strided copy from pageable (often mmap-backed) host memory
+        // degrades to per-row processing in the driver; gathering the rows into a contiguous
+        // host buffer and issuing a single 1D copy is an order of magnitude faster.
+        static thread_local std::vector<char> staging;
+        if (staging.size() < size*n_copies) {
+            staging.resize(size*n_copies);
+        }
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy(staging.data() + i*size, (const char *) data + i*stride_data, size);
+        }
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, staging.data(), size*n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
