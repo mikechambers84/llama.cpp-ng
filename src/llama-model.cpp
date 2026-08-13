@@ -116,6 +116,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen3vlmoe(params);
         case LLM_ARCH_QWEN3TTS:
             return new llama_model_qwen3tts(params);
+        case LLM_ARCH_POCKETTTS:
+            return new llama_model_pockettts(params);
         case LLM_ARCH_PHI2:
             return new llama_model_phi2(params);
         case LLM_ARCH_PHI3:
@@ -431,11 +433,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             rotation = hparams.n_layer() % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
-        if (tensor_axis_0 == nullptr) {
-            GGML_ASSERT(!suffix_fallback.empty());
+        if (tensor_axis_0 == nullptr && !suffix_fallback.empty()) {
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
-        GGML_ASSERT(tensor_axis_0 != nullptr);
+        if (tensor_axis_0 == nullptr) {
+            // Cache tensors can belong to layers whose weights are not loaded, e.g. skipped MTP/nextn layers.
+            // Such layers are never computed, so their caches can simply be mirrored.
+            GGML_ASSERT(tensor_name.substr(0, 6) == "cache_");
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, il, rotation};
+        }
         return {axis, tensor_axis_0, il, rotation};
     };
 
@@ -1289,8 +1295,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
+    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+        for (const auto & dev : devices) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev.dev, &props);
+            if (!props.caps.mmap_support) {
+                ml.use_mmap = false;
+                break;
+            }
+        }
+    }
+
+    const char * load_mode_name = params.load_mode == LLAMA_LOAD_MODE_AUTO
+        ? llama_load_mode_name(ml.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE)
+        : llama_load_mode_name(params.load_mode);
+
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
-        __func__, llama_load_mode_name(params.load_mode));
+        __func__, load_mode_name);
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -2482,7 +2503,7 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
-        /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
+        /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -2652,6 +2673,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_NANBEIGE:
+        case LLM_ARCH_POCKETTTS:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2

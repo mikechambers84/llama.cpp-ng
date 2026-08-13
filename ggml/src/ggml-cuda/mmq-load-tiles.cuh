@@ -661,33 +661,25 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const int sc = __vsubss4(sc_low | sc_high, 0x20202020);
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         const int8_t * sc8 = (const int8_t *) &sc;
         const float d = bxi->d;
 
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 #pragma unroll
         for (int l = 0; l < int(sizeof(int)); ++l) {
             x_df[i*sram_stride + sizeof(int)*ksc + l] = d*sc8[l];
         }
 #else
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = sc;
+        // Decode the sub-scales at load time into one float (d*sc) per
+        // 16-value group, like the MMA branch, so the vec_dot reads clean
+        // floats instead of doing byte-granular scale extraction per dot.
+#pragma unroll
+        for (int l = 0; l < int(sizeof(int)); ++l) {
+            x_df[i*(MMQ_TILE_NE_K/2 + 1) + int(sizeof(int))*ksc + l] = d*sc8[l];
+        }
+        GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
-
-#if !(defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE))
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
-        int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
-
-        if (fallback) {
-            i = min(i, i_max);
-        }
-
-        const block_q3_K * bxi = (const block_q3_K *) x + kbx0 + i*stride;
-
-        x_df[i] = bxi->d;
-    }
-#endif // !(defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)) || defined(AMD_WMMA_AVAILABLE)
 }
 
 static __device__ __forceinline__ int unpack_scales_q45_K(const int * scales, const int ksc) {
@@ -778,9 +770,14 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 #else
+    // Decode the packed 6-bit scales/mins once at load time into one
+    // half2 (d*sc, -dmin*m) per 32-value sub-block, like the MMA branch:
+    // the dp4a vec_dot then reads clean half2 pairs instead of doing
+    // byte-granular scale extraction per dot.
+    constexpr int rows_per_warp = warp_size / 2;
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
-        int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
+    for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
 
         if (fallback) {
             i = min(i, i_max);
@@ -788,26 +785,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
 
-        x_dm[i] = bxi->dm;
-    }
-    constexpr int rows_per_warp = warp_size / 4;
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
-        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
-
-        if (fallback) {
-            i = min(i, i_max);
-        }
-
-        const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride + (threadIdx.x % (MMQ_TILE_NE_K/8)) / (QI4_K/8);
-
         const int * scales = (const int *) bxi->scales;
+        const int ksc = threadIdx.x % 2;
 
-        const int ksc = threadIdx.x % (MMQ_TILE_NE_K/8);
-        const int scales8 = unpack_scales_q45_K(scales, ksc);
+        const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
+        const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
 
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = scales8;
+        const uint8_t * sc8 = (const uint8_t *) &sc32;
+        const uint8_t *  m8 = (const uint8_t *)  &m32;
+
+        const float2 dmf = __half22float2(bxi->dm);
+
+#pragma unroll
+        for (int l = 0; l < (int) sizeof(int); ++l) {
+            x_dm[i*(MMQ_TILE_NE_K/4 + 1) + (int) sizeof(int)*ksc + l] = make_half2(dmf.x*sc8[l], -dmf.y*m8[l]);
+        }
     }
+    GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
@@ -901,23 +895,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 #else
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
-        int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
-
-        if (fallback) {
-            i = min(i, i_max);
-        }
-
-        const block_q5_K * bxi = (const block_q5_K *) x + kbx0 + i*stride;
-
-        x_dm[i] = bxi->dm;
-    }
-
-    constexpr int rows_per_warp = warp_size / 4;
+    // Decode the packed 6-bit scales/mins at load time into one half2
+    // (d*sc, -dmin*m) per 32-value sub-block, same as the q4_K dp4a path.
+    constexpr int rows_per_warp = warp_size / 2;
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
-        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
+        int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
 
         if (fallback) {
             i = min(i, i_max);
@@ -926,12 +909,22 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_q5_K * bxi = (const block_q5_K *) x + kbx0 + i*stride;
 
         const int * scales = (const int *) bxi->scales;
+        const int ksc = threadIdx.x % 2;
 
-        const int ksc = threadIdx.x % (MMQ_TILE_NE_K/8);
-        const int scales8 = unpack_scales_q45_K(scales, ksc);
+        const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
+        const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
 
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + ksc] = scales8;
+        const uint8_t * sc8 = (const uint8_t *) &sc32;
+        const uint8_t *  m8 = (const uint8_t *)  &m32;
+
+        const float2 dmf = __half22float2(bxi->dm);
+
+#pragma unroll
+        for (int l = 0; l < (int) sizeof(int); ++l) {
+            x_dm[i*(MMQ_TILE_NE_K/4 + 1) + (int) sizeof(int)*ksc + l] = make_half2(dmf.x*sc8[l], -dmf.y*m8[l]);
+        }
     }
+    GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
@@ -999,8 +992,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride]                     = bxi->d;
-#else
-        x_df[i*(MMQ_TILE_NE_K/QI6_K) + i/QI6_K] = bxi->d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
@@ -1018,7 +1009,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_sc[i*sram_stride + threadIdx.x%4] = get_int_b2(bxi->scales, threadIdx.x % (MMQ_TILE_NE_K/8));
 #else
-        x_sc[i*(MMQ_TILE_NE_K/8) + i/8 + threadIdx.x%(MMQ_TILE_NE_K/8)] = get_int_b2(bxi->scales, threadIdx.x%(QI6_K/8));
+        // Decode the int8 sub-scales at load time into one float (d*sc) per
+        // 16-value group so the vec_dot reads clean floats.
+        const int     ksc     = threadIdx.x % (MMQ_TILE_NE_K/8);
+        const int     sc32    = get_int_b2(bxi->scales, ksc);
+        const int8_t * sc8    = (const int8_t *) &sc32;
+        const float   d       = bxi->d;
+
+#pragma unroll
+        for (int l = 0; l < (int) sizeof(int); ++l) {
+            x_df[i*(MMQ_TILE_NE_K/2 + 1) + (int) sizeof(int)*ksc + l] = d*sc8[l];
+        }
+        GGML_UNUSED(x_sc);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -1084,6 +1086,64 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #else
         x_ds[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = make_half2(d1q, d1q*delta);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    // IQ1_M always uses the dp4a data layout, see ggml_cuda_mmq_config::use_mma_data_layout.
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ1_M, I);
+    int   * x_qs = (int   *)  x_tile;
+    half2 * x_ds = (half2 *) (x_qs + txs.qs);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR1_M); // one thread per 32-value sub-block
+    constexpr int nrows = warp_size / threads_per_row;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_iq1_m * bxi = (const block_iq1_m *) x + kbx0 + i*stride;
+
+        const int       qs_packed = get_int_b4(bxi->qs, kqsx);
+        const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+        const uint16_t * sc = (const uint16_t *) bxi->scales;
+
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        const float d = __half2float(scale.f16);
+
+        const int tmp = sc[kqsx/2] >> (6*(kqsx % 2));
+        const int sc0 = 2*((tmp >> 0) & 0x07) + 1;
+        const int sc1 = 2*((tmp >> 3) & 0x07) + 1;
+
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int qhl = bxi->qh[2*kqsx + l0/4] >> (4 * ((l0/2) % 2));
+
+            const int grid = iq1s_grid_gpu[qs[l0/2] | ((qhl & 0x07) << 8)];
+
+            const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+            const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (l0+0)] = grid0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (l0+1)] = grid1;
+
+            // Per 8 values: effective scale (d * 3-bit sub-scale) and the signed delta term.
+            const float dsc   = d * (l0 < 4 ? sc0 : sc1);
+            const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f*IQ1M_DELTA/0x08);
+            x_ds[i*(MMQ_TILE_NE_K + 1) + 4*kqsx + l0/2] = make_half2(dsc, dsc*delta);
+        }
     }
 }
 

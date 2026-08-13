@@ -811,6 +811,7 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
         // a node device must not map file pages, its buffers have to be bound to the node
         /* .buffer_from_host_ptr  = */ ctx->numa_node < 0,
         /* .events                = */ false,
+        /* .mmap_support          = */ true,
     };
 }
 
