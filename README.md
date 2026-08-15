@@ -1,3 +1,38 @@
+# llama.cpp-ng
+
+**llama.cpp-ng** is a performance-oriented fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
+with additional hardware topology support, inference optimizations, extended
+architecture support and experimental features. It tracks upstream master and
+stays fully compatible with it: same models, same tools, same APIs.
+
+What it adds:
+
+- **NUMA-aware CPU inference** — `--numa split` exposes every NUMA node as its
+  own device (`CPU0`, `CPU1`, ...), so `--device`, `--override-tensor` and the
+  split modes can place weights and threads per node. Multi-socket machines can
+  run tensor-parallel inference across sockets instead of fighting cross-node
+  memory traffic. See [docs/numa.md](docs/numa.md).
+- **Tensor parallelism for DeepSeek V4** — `--split-mode tensor` support for
+  the DeepSeek V4 architecture (MLA-style attention with grouped output
+  projection), plus fixes that make tensor split production-usable: models with
+  MTP layers load correctly, llama-server no longer crashes on cache clears,
+  and split-tensor model loads are dramatically faster.
+- **CUDA/HIP kernel optimizations** — MMQ support for IQ1_M (previously the
+  only IQ type without it), load-time scale decoding for K-quants in the dp4a
+  MMQ path, and RDNA2-specific matrix-vector tuning. Faster prompt processing
+  for quantized models on dp4a-path GPUs (developed and measured on RDNA2).
+- **Generic CPU optimizations** — improved x86 kernels and scheduling in the
+  CPU backend (block-interleaved K-quant kernels, cache-line-aware matvec
+  partitioning, better thread scheduling for small ops and MoE dispatch).
+
+Benchmarks across a range of models and quantizations are being prepared and
+will be published here. The generally useful pieces are being submitted
+upstream; this fork carries them today, integrated and tested together.
+
+The original llama.cpp README follows below.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
