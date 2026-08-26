@@ -221,25 +221,17 @@ export { default as ChatFormActionModels } from './ChatForm/ChatFormActions/Chat
 export { default as ChatFormActionAddToolsSubmenu } from './ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddToolsSubmenu.svelte';
 
 /**
- * Dropdown submenu for managing MCP servers in the chat form.
+ * Dropdown submenu for MCP prompts and resources in the chat form.
  *
- * Displays a searchable list of enabled MCP servers with toggle switches
- * to enable/disable each server for chat. Shows server favicon, health status,
- * and a "Manage MCP Servers" settings link.
- *
- * Features:
- * - Search/filter servers by name or URL
- * - Per-server toggle to enable/disable for chat
- * - Health check indicator (shows "Error" badge for failed servers)
- * - Server favicon display
- * - Settings link to manage MCP server configuration
+ * Shows an "MCP" sub-menu item with entries for MCP Prompts and MCP
+ * Resources. Only visible when the server supports them.
  *
  * @example
  * ```svelte
- * <ChatFormActionAddMcpServersSubmenu onMcpSettingsClick={handleMcpSettingsClick} />
+ * <ChatFormActionAddMcpSubmenu />
  * ```
  */
-export { default as ChatFormActionAddMcpServersSubmenu } from './ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddMcpServersSubmenu.svelte';
+export { default as ChatFormActionAddMcpSubmenu } from './ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddMcpSubmenu.svelte';
 
 /**
  * Dropdown submenu for selecting reasoning effort level.
@@ -685,6 +677,18 @@ export { default as ChatMessageSystem } from './ChatMessages/ChatMessage/ChatMes
  * ```
  */
 export { default as ChatScreen } from './ChatScreen/ChatScreen.svelte';
+
+/**
+ * **ChatTabs** - Browser-style tab bar for open conversations
+ *
+ * Horizontal strip of tabs rendered above ChatScreen in the chat layout,
+ * one per conversation tracked by tabsStore. The active tab follows the
+ * route's conversation id; clicking a tab navigates to it, middle-click or
+ * the close button closes it (switching to the left neighbor when closing
+ * the active tab), and a trailing "+" button starts a new chat. Shows a
+ * spinner on tabs with a running generation. Desktop-only.
+ */
+export { default as ChatTabs } from './ChatTabs/ChatTabs.svelte';
 
 /**
  * Visual overlay displayed when user drags files over the chat screen.
