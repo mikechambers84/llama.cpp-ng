@@ -12,11 +12,6 @@ What it adds:
   split modes can place weights and threads per node. Multi-socket machines can
   run tensor-parallel inference across sockets instead of fighting cross-node
   memory traffic. See [docs/numa.md](docs/numa.md).
-- **Tensor parallelism for DeepSeek V4** — `--split-mode tensor` support for
-  the DeepSeek V4 architecture (MLA-style attention with grouped output
-  projection), plus fixes that make tensor split production-usable: models with
-  MTP layers load correctly, llama-server no longer crashes on cache clears,
-  and split-tensor model loads are dramatically faster.
 - **CUDA/HIP kernel optimizations** — MMQ support for IQ1_M (previously the
   only IQ type without it), load-time scale decoding for K-quants in the dp4a
   MMQ path, and RDNA2-specific matrix-vector tuning. Faster prompt processing
