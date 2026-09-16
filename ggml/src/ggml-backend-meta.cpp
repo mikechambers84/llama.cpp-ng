@@ -416,7 +416,12 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 static ggml_backend_buffer_type_t * ggml_backend_meta_dev_get_extra_bufts(ggml_backend_dev_t dev) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     static std::map<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>> extra_bufts_cache;
-    static std::map<std::vector<ggml_backend_buffer_type_t>, struct ggml_backend_buffer_type> extra_meta_bufts;
+    // keyed by the meta device as well as the simple buffer types: two meta devices over the same
+    // simple devices (e.g. a target model and its draft, both tensor-split) share the same extras,
+    // but each buffer type carries its own device, and the split state is looked up through it. a
+    // key without the device hands the second model the first model's device, and hence the first
+    // model's hparams
+    static std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>>, struct ggml_backend_buffer_type> extra_meta_bufts;
     {
         auto it = extra_bufts_cache.find(dev);
         if (it != extra_bufts_cache.end()) {
@@ -466,7 +471,8 @@ static ggml_backend_buffer_type_t * ggml_backend_meta_dev_get_extra_bufts(ggml_b
         for (size_t i = 0; i < n_devs; i++) {
             simple_bufts.push_back(extras[i][k]);
         }
-        auto it = extra_meta_bufts.find(simple_bufts);
+        auto key = std::make_pair(dev, simple_bufts);
+        auto it = extra_meta_bufts.find(key);
         if (it == extra_meta_bufts.end()) {
             ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
             struct ggml_backend_buffer_type meta_buft = {
@@ -474,7 +480,7 @@ static ggml_backend_buffer_type_t * ggml_backend_meta_dev_get_extra_bufts(ggml_b
                 /*device =*/ dev,
                 /*ctx    =*/ buft_ctx,
             };
-            it = extra_meta_bufts.emplace(simple_bufts, meta_buft).first;
+            it = extra_meta_bufts.emplace(std::move(key), meta_buft).first;
         }
         result.push_back(&it->second);
     }
