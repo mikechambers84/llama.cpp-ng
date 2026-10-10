@@ -329,6 +329,13 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // layer proportions in device order; NULL uses tensor_split for compatibility
+        const float * layer_split;
+
+        // tensor proportions inside CPU Meta, in selected NUMA device order; NULL means equal shares
+        const float * cpu_tensor_split;
+        size_t cpu_tensor_split_count;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.

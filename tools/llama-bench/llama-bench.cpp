@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <clocale>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -427,6 +428,8 @@ struct cmd_params {
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
+    std::vector<std::vector<float>>  layer_split;
+    std::vector<std::vector<float>>  cpu_tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
@@ -471,6 +474,8 @@ static const cmd_params cmd_params_defaults = {
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
+    /* layer_split          */ { {} },
+    /* cpu_tensor_split     */ { {} },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
@@ -544,7 +549,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
-    printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
+    printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0; legacy layer-mode alias)\n");
+    printf("  --layer-split <ls0/ls1/..>                       layer proportions in device order\n");
+    printf("  --cpu-tensor-split <cs0/cs1/..>                  CPU Meta proportions (default: equal)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
     printf("                                                    (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
@@ -977,7 +984,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
-            } else if (arg == "-ts" || arg == "--tensor-split") {
+            } else if (arg == "-ts" || arg == "--tensor-split" || arg == "--layer-split" || arg == "--cpu-tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
@@ -987,7 +994,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     const std::regex           regex{ R"([;/]+)" };
                     std::sregex_token_iterator it{ ts.begin(), ts.end(), regex, -1 };
                     std::vector<std::string>   split_arg{ it, {} };
-                    GGML_ASSERT(split_arg.size() <= llama_max_devices());
+                    if (split_arg.empty() || split_arg.size() > llama_max_devices()) {
+                        throw std::invalid_argument("too many split shares");
+                    }
 
                     std::vector<float> tensor_split(llama_max_devices());
                     for (size_t i = 0; i < llama_max_devices(); ++i) {
@@ -997,7 +1006,28 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                             tensor_split[i] = 0.0f;
                         }
                     }
-                    params.tensor_split.push_back(tensor_split);
+                    if (arg == "--layer-split" || arg == "--cpu-tensor-split") {
+                        double sum = 0.0;
+                        for (size_t j = 0; j < split_arg.size(); ++j) {
+                            size_t end;
+                            const float share = std::stof(split_arg[j], &end);
+                            if (end != split_arg[j].size() || !std::isfinite(share) || share < 0.0f || (arg == "--cpu-tensor-split" && share == 0.0f)) {
+                                throw std::invalid_argument("invalid split share");
+                            }
+                            sum += share;
+                        }
+                        if (sum <= 0.0 || sum > std::numeric_limits<float>::max()) {
+                            throw std::invalid_argument("invalid split share sum");
+                        }
+                    }
+                    if (arg == "--cpu-tensor-split") {
+                        tensor_split.resize(split_arg.size());
+                        params.cpu_tensor_split.push_back(tensor_split);
+                    } else if (arg == "--layer-split") {
+                        params.layer_split.push_back(tensor_split);
+                    } else {
+                        params.tensor_split.push_back(tensor_split);
+                    }
                 }
             } else if (arg == "-ot" || arg == "--override-tensor") {
                 if (++i >= argc) {
@@ -1180,6 +1210,24 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.devices.empty()) {
         params.devices = cmd_params_defaults.devices;
     }
+    if (!params.layer_split.empty()) {
+        if (!params.tensor_split.empty()) {
+            fprintf(stderr, "error: use either --layer-split or --tensor-split\n");
+            exit(1);
+        }
+        for (auto mode : params.split_mode) {
+            if (mode != LLAMA_SPLIT_MODE_LAYER) {
+                fprintf(stderr, "error: --layer-split requires layer mode\n");
+                exit(1);
+            }
+        }
+    }
+    if (params.layer_split.empty()) {
+        params.layer_split = cmd_params_defaults.layer_split;
+    }
+    if (params.cpu_tensor_split.empty()) {
+        params.cpu_tensor_split = cmd_params_defaults.cpu_tensor_split;
+    }
     if (params.tensor_split.empty()) {
         params.tensor_split = cmd_params_defaults.tensor_split;
     }
@@ -1239,6 +1287,8 @@ struct cmd_params_instance {
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
+    std::vector<float> layer_split;
+    std::vector<float> cpu_tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               embeddings;
     bool               no_op_offload;
@@ -1257,6 +1307,9 @@ struct cmd_params_instance {
         mparams.load_mode     = load_mode;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
+        mparams.layer_split   = layer_split.empty() ? nullptr : layer_split.data();
+        mparams.cpu_tensor_split = cpu_tensor_split.empty() ? nullptr : cpu_tensor_split.data();
+        mparams.cpu_tensor_split_count = cpu_tensor_split.size();
         mparams.no_host       = no_host;
 
         if (n_cpu_moe <= 0) {
@@ -1302,6 +1355,7 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
+               layer_split == other.layer_split && cpu_tensor_split == other.cpu_tensor_split &&
                load_mode == other.load_mode && devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1339,6 +1393,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
+    for (const auto & ls : params.layer_split)
+    for (const auto & cts : params.cpu_tensor_split)
     for (const auto & ot : params.tensor_buft_overrides)
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
@@ -1380,6 +1436,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .layer_split           = */ ls,
+                /* .cpu_tensor_split      = */ cts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1416,6 +1474,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .layer_split           = */ ls,
+                /* .cpu_tensor_split      = */ cts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1452,6 +1512,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .layer_split           = */ ls,
+                /* .cpu_tensor_split      = */ cts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1493,6 +1555,8 @@ struct test {
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
+    std::vector<float>       layer_split;
+    std::vector<float>       cpu_tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool                     embeddings;
     bool                     no_op_offload;
@@ -1532,6 +1596,8 @@ struct test {
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
+        layer_split    = inst.layer_split;
+        cpu_tensor_split = inst.cpu_tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
@@ -1594,6 +1660,7 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "layer_split", "cpu_tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
@@ -1626,6 +1693,22 @@ struct test {
     }
 
     std::vector<std::string> get_values() const {
+        auto split_string = [](const std::vector<float> & shares) {
+            size_t count = shares.size();
+            while (count > 1 && shares[count - 1] == 0.0f) {
+                --count;
+            }
+            std::string value;
+            for (size_t i = 0; i < count; ++i) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.2f", shares[i]);
+                if (i) {
+                    value += "/";
+                }
+                value += buf;
+            }
+            return value;
+        };
         std::string tensor_split_str;
         std::string tensor_buft_overrides_str;
         int         max_nonzero = 0;
@@ -1687,6 +1770,8 @@ struct test {
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,
+                                            split_string(layer_split),
+                                            split_string(cpu_tensor_split),
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
                                             std::to_string(embeddings),
@@ -1928,6 +2013,12 @@ struct markdown_printer : public printer {
         if (field == "tensor_split") {
             return "ts";
         }
+        if (field == "layer_split") {
+            return "ls";
+        }
+        if (field == "cpu_tensor_split") {
+            return "cts";
+        }
         if (field == "tensor_buft_overrides") {
             return "ot";
         }
@@ -1993,6 +2084,12 @@ struct markdown_printer : public printer {
         }
         if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
             fields.emplace_back("devices");
+        }
+        if (params.layer_split != cmd_params_defaults.layer_split) {
+            fields.emplace_back("layer_split");
+        }
+        if (params.cpu_tensor_split != cmd_params_defaults.cpu_tensor_split) {
+            fields.emplace_back("cpu_tensor_split");
         }
         if (params.tensor_split.size() > 1 || params.tensor_split != cmd_params_defaults.tensor_split) {
             fields.emplace_back("tensor_split");

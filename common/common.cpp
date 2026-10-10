@@ -1690,6 +1690,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.tensor_read_lazy = params.tensor_read_lazy;
     mparams.tensor_split    = params.tensor_split;
+    mparams.layer_split     = params.layer_split.empty() ? nullptr : params.layer_split.data();
+    mparams.cpu_tensor_split = params.cpu_tensor_split.empty() ? nullptr : params.cpu_tensor_split.data();
+    mparams.cpu_tensor_split_count = params.cpu_tensor_split.size();
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

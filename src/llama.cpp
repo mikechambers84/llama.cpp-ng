@@ -19,11 +19,13 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstddef>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <limits>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -196,6 +198,31 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    if (params.layer_split) {
+        double sum = 0.0;
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            float share = params.layer_split[i];
+            if (!std::isfinite(share) || share < 0.0f) {
+                LLAMA_LOG_ERROR("%s: layer shares must be finite and nonnegative\n", __func__);
+                return false;
+            }
+            sum += share;
+        }
+        if (sum <= 0.0 || sum > std::numeric_limits<float>::max()) {
+            LLAMA_LOG_ERROR("%s: invalid layer share sum\n", __func__);
+            return false;
+        }
+    }
+    if (params.layer_split && params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+        LLAMA_LOG_ERROR("%s: layer_split requires layer mode\n", __func__);
+        return false;
+    }
+    if (params.cpu_tensor_split_count && (!params.cpu_tensor_split || !params.devices || params.split_mode != LLAMA_SPLIT_MODE_LAYER)) {
+        LLAMA_LOG_ERROR("%s: cpu_tensor_split requires layer mode and explicit NUMA devices\n", __func__);
+        return false;
+    }
+    model->get_split_state_ud.tensor_split = model->tensor_split();
+
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -217,11 +244,82 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 true, ggml_backend_meta_device(
                 params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
-        } else {
-            for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+
+    } else if (params.split_mode == LLAMA_SPLIT_MODE_LAYER) {
+        std::vector<ggml_backend_dev_t> numa_devs;
+
+        for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+            if (llama_dev_numa_node(*dev) >= 0) {
+                numa_devs.push_back(*dev);
+            } else {
                 model->devices.push_back({false, *dev});
             }
         }
+
+        if (params.cpu_tensor_split_count) {
+            if (numa_devs.size() < 2 || params.cpu_tensor_split_count != numa_devs.size()) {
+                LLAMA_LOG_ERROR("%s: cpu_tensor_split needs one share per CPU Meta device (%zu nodes)\n", __func__, numa_devs.size());
+                return false;
+            }
+            double sum = 0.0;
+            for (size_t i = 0; i < params.cpu_tensor_split_count; ++i) {
+                const float share = params.cpu_tensor_split[i];
+                if (!std::isfinite(share) || share <= 0.0f) {
+                    LLAMA_LOG_ERROR("%s: CPU tensor shares must be finite and positive\n", __func__);
+                    return false;
+                }
+                sum += share;
+            }
+            if (sum > std::numeric_limits<float>::max()) {
+                LLAMA_LOG_ERROR("%s: CPU tensor share sum is too large\n", __func__);
+                return false;
+            }
+        }
+
+        if (numa_devs.size() >= 2) {
+            model->get_split_state_ud.n_devices = numa_devs.size();
+            model->get_split_state_ud.model     = model;
+            model->get_split_state_ud.tensor_split = model->cpu_tensor_split();
+
+            auto * cpu_meta = ggml_backend_meta_device(
+                numa_devs.data(),
+                numa_devs.size(),
+                llama_meta_device_get_split_state,
+                &model->get_split_state_ud);
+
+            model->devices.push_back({true, cpu_meta});
+
+            // TEST: redirect CPU tensor overrides (e.g. -ncmoe) to NUMA CPU Meta.
+            if (params.tensor_buft_overrides) {
+                auto * overrides = const_cast<llama_model_tensor_buft_override *>(
+                params.tensor_buft_overrides);
+
+                for (; overrides->pattern != nullptr; ++overrides) {
+                   if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                       overrides->buft = ggml_backend_dev_buffer_type(cpu_meta);
+
+                       LLAMA_LOG_INFO(
+                            "%s: redirecting tensor override '%s' from CPU to %s\n",
+                            __func__,
+                            overrides->pattern,
+                            ggml_backend_buft_name(overrides->buft));
+                   }
+                }
+            }
+            LLAMA_LOG_INFO("%s: added CPU NUMA Meta device from %zu nodes\n",
+                       __func__, numa_devs.size());
+        } else {
+            for (auto * dev : numa_devs) {
+                model->devices.push_back({false, dev});
+            }
+        }
+    } else {
+        for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+            model->devices.push_back({false, *dev});
+        }
+    }
+
+
     } else {
         // default device selection
 
@@ -366,6 +464,22 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         }
     }
 
+    if (params.layer_split) {
+        double selected_sum = 0.0;
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            if (i < model->devices.size()) {
+                selected_sum += params.layer_split[i];
+            } else if (params.layer_split[i] != 0.0f) {
+                LLAMA_LOG_ERROR("%s: layer_split has shares beyond the selected devices\n", __func__);
+                return false;
+            }
+        }
+        if (selected_sum <= 0.0) {
+            LLAMA_LOG_ERROR("%s: layer_split has no share for the selected devices\n", __func__);
+            return false;
+        }
+    }
+
     for (const auto & dev : model->devices) {
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev.dev, &props);
@@ -382,6 +496,20 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        std::vector<llama_model_tensor_buft_override> overrides_owned;
+
+        if (params.tensor_buft_overrides) {
+            for (auto * p = params.tensor_buft_overrides; ; ++p) {
+                overrides_owned.push_back(*p);
+
+                if (p->pattern == nullptr) {
+                    break;
+                }
+            }
+
+            params.tensor_buft_overrides = overrides_owned.data();
+        }
+
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 

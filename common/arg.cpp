@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -713,6 +714,34 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 // CLI argument parsing functions
 //
 
+static std::vector<float> parse_split_shares(const std::string & value, bool cpu) {
+    auto parts = string_split<std::string>(value, '/');
+    if (parts.size() == 1) {
+        parts = string_split<std::string>(value, ',');
+    }
+    if (parts.empty() || parts.size() > llama_max_devices()) {
+        throw std::invalid_argument("too many split shares");
+    }
+    std::vector<float> shares;
+    double sum = 0.0;
+    for (const auto & part : parts) {
+        size_t end;
+        float share = std::stof(part, &end);
+        if (end != part.size() || !std::isfinite(share) || share < 0.0f || (cpu && share == 0.0f)) {
+            throw std::invalid_argument("split shares must be finite and nonnegative (positive for CPU tensors)");
+        }
+        sum += share;
+        shares.push_back(share);
+    }
+    if (sum <= 0.0 || sum > std::numeric_limits<float>::max()) {
+        throw std::invalid_argument("invalid split share sum");
+    }
+    if (!cpu) {
+        shares.resize(llama_max_devices(), 0.0f);
+    }
+    return shares;
+}
+
 static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value);
 
 // apply config files (if present), a later file overrides an earlier one:
@@ -895,6 +924,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    if (!params.layer_split.empty()) {
+        if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+            throw std::invalid_argument("--layer-split requires --split-mode layer");
+        }
+        for (float share : params.tensor_split) {
+            if (share != 0.0f) {
+                throw std::invalid_argument("use either --layer-split or --tensor-split in layer mode");
+            }
+        }
+    }
 
     // devices and tensor buffer overrides resolve only now: under --numa split the node devices
     // exist only after initialization, and this way the arguments work in any order. skipped for
@@ -2904,8 +2944,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"--layer-split"}, "N0/N1/...",
+        "layer proportions in device order, including CPU Meta as one device; requires layer mode",
+        [](common_params & params, const std::string & value) {
+            params.layer_split = parse_split_shares(value, false);
+        }
+    ));
+    add_opt(common_arg(
+        {"--cpu-tensor-split"}, "N0/N1/...",
+        "tensor proportions within CPU Meta in selected NUMA device order (default: equal shares)",
+        [](common_params & params, const std::string & value) {
+            params.cpu_tensor_split = parse_split_shares(value, true);
+        }
+    ));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
-        "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
+        "device proportions for tensor/row splitting; legacy layer-mode alias for --layer-split, e.g. 3,1",
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 

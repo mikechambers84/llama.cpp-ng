@@ -462,15 +462,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
         if (tensor_axis_0 == nullptr) {
-            // Cache tensors can belong to layers whose weights are not loaded, e.g. skipped MTP/nextn layers.
-            // Such layers are never computed, so their caches can simply be mirrored.
-            GGML_ASSERT(tensor_name.substr(0, 6) == "cache_");
+            // Tensors from skipped MTP/NextN layers are present in the GGUF but are not
+            // loaded into the model. They are never used by the main decoder graph, so
+            // their split layout is irrelevant; mirror them to satisfy meta-split.
+            const bool is_skipped_nextn =
+                tensor_name.substr(0, 4) == "blk." &&
+                hparams.n_layer_nextn > 0 &&
+                il >= hparams.n_layer() &&
+                il < hparams.n_layer_all;
+
+            // Cache tensors can likewise belong to skipped MTP/NextN layers.
+            const bool is_cache = tensor_name.substr(0, 6) == "cache_";
+
+            GGML_ASSERT(is_cache || is_skipped_nextn);
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, il, rotation};
         }
         return {axis, tensor_axis_0, il, rotation};
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        if (!is_dsv4 && hparams.is_mla() && (std::regex_match(tensor_name, pattern_kv_cache) ||
+                (tensor_name.compare(0, 4, "blk.") == 0 && tensor_name.find(".attn_") != std::string::npos))) {
+            // Keep MLA attention and its shared latent cache replicated; FFN tensors retain their split rules.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -786,10 +801,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
+    tc.rotation = 0;
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
-        const float * tensor_split = ud->model->tensor_split();
+        const float * tensor_split = ud->tensor_split;
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
@@ -1192,6 +1208,8 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::vector<float> layer_split_owned;
+    std::vector<float> cpu_tensor_split_owned;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1200,6 +1218,14 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.layer_split != nullptr) {
+        pimpl->layer_split_owned.assign(params.layer_split, params.layer_split + llama_max_devices());
+        this->params.layer_split = pimpl->layer_split_owned.data();
+    }
+    if (params.cpu_tensor_split != nullptr) {
+        pimpl->cpu_tensor_split_owned.assign(params.cpu_tensor_split, params.cpu_tensor_split + params.cpu_tensor_split_count);
+        this->params.cpu_tensor_split = pimpl->cpu_tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -1412,7 +1438,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
-    const auto & tensor_split = params.tensor_split;
+    const float * tensor_split = split_mode == LLAMA_SPLIT_MODE_LAYER && params.layer_split ? params.layer_split : params.tensor_split;
 
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
@@ -1883,6 +1909,10 @@ size_t llama_model::n_tensors() const {
 
 size_t llama_model::n_devices() const {
     return devices.size();
+}
+
+const float * llama_model::cpu_tensor_split() const {
+    return params.cpu_tensor_split;
 }
 
 const float * llama_model::tensor_split() const {
@@ -2718,6 +2748,9 @@ llama_model_params llama_model_default_params() {
         /*.tensor_read_lazy            =*/ LLAMA_TENSOR_READ_LAZY_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.layer_split                 =*/ nullptr,
+        /*.cpu_tensor_split            =*/ nullptr,
+        /*.cpu_tensor_split_count      =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -3170,6 +3203,13 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+    if (flags & TENSOR_SKIP) {
+        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, skip | TENSOR_SKIP_IF_VIRTUAL);
+        create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, skip);
+        create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, skip);
+        return;
+    }
     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);

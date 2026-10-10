@@ -462,6 +462,9 @@ static void common_params_fit_impl(
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
         throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
     }
+    if (mparams->layer_split) {
+        throw common_params_fit_exception("model_params::layer_split already set by user, abort");
+    }
     if (nd > 1) {
         if (!tensor_split) {
             throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
